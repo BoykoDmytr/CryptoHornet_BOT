@@ -1,4 +1,3 @@
-# ann_sources.py
 from __future__ import annotations
 import re
 from typing import List, Dict, Any, Iterable, Optional
@@ -14,7 +13,17 @@ HEADERS = {
 }
 
 # ------ утиліти ---------------------------------------------------------------
-RE_DT = re.compile(r"(?P<h>\d{1,2}):(?P<m>\d{2})\s*,?\s*(?P<d>\d{1,2})\s+(?P<mon>[A-Za-zА-Яа-яІіЄєЇї]+)\s+(?P<y>\d{4})")
+# 2 шаблони: "час → дата" і "дата → час" (OKX), враховує UTC/GMT
+RE_TIME_FIRST = re.compile(
+    r"(?P<h>\d{1,2}):(?P<m>\d{2})\s*(?P<tz>UTC|GMT)?\s*,?\s*(?P<d>\d{1,2})\s+(?P<mon>[A-Za-zА-Яа-яІіЄєЇї]+)\s+(?P<y>\d{4})",
+    re.I,
+)
+RE_DATE_FIRST = re.compile(
+    r"(?P<d>\d{1,2})\s+(?P<mon>[A-Za-zА-Яа-яІіЄєЇї]+)\s+(?P<y>\d{4}).{0,80}?"
+    r"(?P<h>\d{1,2}):(?P<m>\d{2})\s*(?P<tz>UTC|GMT)?",
+    re.I | re.S,
+)
+
 MONTHS = {
     # uk
     "січня":1,"лютого":2,"березня":3,"квітня":4,"травня":5,"червня":6,"липня":7,"серпня":8,"вересня":9,"жовтня":10,"листопада":11,"грудня":12,
@@ -40,7 +49,8 @@ def uniq(seq: Iterable[str]) -> List[str]:
 
 def extract_symbols(text: str) -> List[str]:
     out = set()
-    for m in RE_PAIR.finditer(text.upper()):
+    up = text.upper()
+    for m in RE_PAIR.finditer(up):
         sym = (m.group(1) or m.group(2) or "").strip()
         if not sym:
             continue
@@ -49,16 +59,26 @@ def extract_symbols(text: str) -> List[str]:
         out.add(sym)
     return sorted(out)
 
-def parse_dt_kiev(text: str) -> Optional[datetime]:
-    m = RE_DT.search(text)
-    if not m: return None
-    h, mi = int(m.group("h")), int(m.group("m"))
-    d, y = int(m.group("d")), int(m.group("y"))
-    mon = MONTHS.get(m.group("mon").lower())
-    if not mon: return None
-    return UA_TZ.localize(datetime(y, mon, d, h, mi))
+def _mk_dt(d: int, mon_name: str, y: int, h: int, m: int, tz_token: str | None):
+    mon = MONTHS.get(mon_name.lower())
+    if not mon:
+        return None
+    naive = datetime(y, mon, d, h, m)
+    if tz_token and tz_token.upper() in ("UTC", "GMT"):
+        return pytz.utc.localize(naive).astimezone(UA_TZ)
+    return UA_TZ.localize(naive)
 
-# ------ MEXC: лише FUTURES ----------------------------------------------------
+def parse_dt_kiev(text: str) -> Optional[datetime]:
+    t = " ".join(text.split())
+    m = RE_TIME_FIRST.search(t)
+    if m:
+        return _mk_dt(int(m["d"]), m["mon"], int(m["y"]), int(m["h"]), int(m["m"]), m.group("tz"))
+    m2 = RE_DATE_FIRST.search(t)
+    if m2:
+        return _mk_dt(int(m2["d"]), m2["mon"], int(m2["y"]), int(m2["h"]), int(m2["m"]), m2.group("tz"))
+    return None
+
+# ------ MEXC: ЛИШЕ FUTURES ----------------------------------------------------
 def mexc_futures_latest(locale: str = "uk-UA") -> List[Dict[str, Any]]:
     base = f"https://www.mexc.com/{locale}/announcements/new-listings/19"
     soup = BeautifulSoup(get_html(base), "html.parser")
@@ -124,7 +144,7 @@ def bingx_collect(section_url: str, market: str) -> List[Dict[str, Any]]:
         title = s.find(["h1","h2"]).get_text(" ", strip=True) if s.find(["h1","h2"]) else ""
         plain = s.get_text(" ", strip=True)
         syms = extract_symbols(plain)
-        dt = parse_dt_kiev(plain)  # за потреби підженемо таймзону
+        dt = parse_dt_kiev(plain)
         out.append({"exchange":"bingx","market":market,"title":title,"symbols":syms,"start_dt":dt,"url":u})
     return out
 
@@ -161,7 +181,13 @@ def bitget_spot_latest() -> List[Dict[str, Any]]:
 def bitget_futures_latest() -> List[Dict[str, Any]]:
     return bitget_collect("https://www.bitget.com/support/sections/12508313405000", "futures")
 
-# ------ OKX: spot + futures ----------------------------------------------------
+# ------ OKX: spot + futures (з фільтром за префіксом 'Лістинг/Листинг/Listing') ----
+def _title_is_listing(title: str) -> bool:
+    if not title:
+        return False
+    t = title.strip().lstrip("[]()【】—-–·* ").lower()
+    return t.startswith(("лістинг", "листинг", "listing"))
+
 def okx_latest() -> List[Dict[str, Any]]:
     url = "https://www.okx.com/ua/help/section/announcements-new-listings"
     soup = BeautifulSoup(get_html(url), "html.parser")
@@ -177,6 +203,8 @@ def okx_latest() -> List[Dict[str, Any]]:
     for u in links:
         s = BeautifulSoup(get_html(u), "html.parser")
         title = s.find(["h1","h2"]).get_text(" ", strip=True) if s.find(["h1","h2"]) else ""
+        if not _title_is_listing(title):
+            continue
         plain = s.get_text(" ", strip=True)
         syms = extract_symbols(plain)
         market = "futures" if any(k in plain.lower() for k in ["swap", "perpetual", "ф'ючер"]) else "spot"
@@ -186,7 +214,7 @@ def okx_latest() -> List[Dict[str, Any]]:
 
 # ------ BINANCE: spot + futures + alpha ---------------------------------------
 def binance_latest(rows: int = 20) -> List[Dict[str, Any]]:
-    catalogs = [48, 251, 137]  # 48=new listings, 251=futures, 137=alpha/research (може змінюватись)
+    catalogs = [48, 251, 137]  # 48=new listings, 251=futures, 137=alpha/research
     out: List[Dict[str, Any]] = []
     for cat in catalogs:
         try:
@@ -227,6 +255,6 @@ def sources_matrix() -> List:
         bingx_futures_latest,
         bitget_spot_latest,
         bitget_futures_latest,
-        okx_latest,               # spot + futures
+        okx_latest,               # spot + futures (із префікс-фільтром)
         binance_latest,           # spot + futures + alpha
     ]

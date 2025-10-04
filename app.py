@@ -4,8 +4,6 @@ from __future__ import annotations
 import os
 import sys
 import yaml
-import time
-import pytz
 import asyncio
 import sqlite3
 import logging
@@ -13,19 +11,25 @@ from typing import List, Optional
 from datetime import datetime
 
 from dotenv import load_dotenv
+import pytz
 import requests
 
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
-
+# --- Telegram Bot API (команди/сервісні) ---
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# --- твої парсери з тг-каналів (якщо користуєшся) ---
-# якщо цього файлу нема, можеш закоментувати 2 рядки нижче (+ виклики з run_watcher)
-from parser_patterns import parse_any, ListingEvent  # noqa: F401
+# --- Telethon (опційно: моніторинг тг-каналів) ---
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 
-# --- парсери анонсів бірж (новий модуль знизу) ---
+# --- (опційно) локальний парсер для тг-постів ---
+try:
+    from parser_patterns import parse_any, ListingEvent  # type: ignore
+except Exception:
+    ListingEvent = object  # заглушка
+    def parse_any(*args, **kwargs): return []
+
+# --- парсери анонсів бірж ---
 from ann_sources import sources_matrix
 
 # ----------------------- LOGGING -----------------------
@@ -41,32 +45,29 @@ load_dotenv()
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
-SESSION_NAME = os.getenv("SESSION_NAME", "hornet_session")  # локально
-SESSION_STRING = os.getenv("SESSION_STRING", "").strip()     # для хмари
+SESSION_NAME = os.getenv("SESSION_NAME", "hornet_session")
+SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "")  # e.g. -100123...
+TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "")
 OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID", "")
 
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Kyiv")
-ANN_INTERVAL_SEC = int(os.getenv("ANN_INTERVAL_SEC", "180"))  # кожні 3 хв за замовч.
+ANN_INTERVAL_SEC = int(os.getenv("ANN_INTERVAL_SEC", "180"))
 
 TZ = pytz.timezone(TIMEZONE)
 
 # ----------------------- DB ---------------------------
-DB_PATH = "state.db"
-conn = sqlite3.connect(DB_PATH)
+DB_PATH = os.getenv("DB_PATH", "state.db")  # на Render: поставь /data/state.db (із підключеним Disk)
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
 
-cur.execute(
-    """
-    CREATE TABLE IF NOT EXISTS seen_messages(
-      channel_id INTEGER,
-      msg_id INTEGER,
-      PRIMARY KEY(channel_id, msg_id)
-    )
-    """
-)
+cur.execute("""
+CREATE TABLE IF NOT EXISTS seen_messages(
+  channel_id INTEGER,
+  msg_id INTEGER,
+  PRIMARY KEY(channel_id, msg_id)
+)""")
 cur.execute("""
 CREATE TABLE IF NOT EXISTS seen_announcements(
   url TEXT PRIMARY KEY,
@@ -110,39 +111,36 @@ def send_owner(text: str):
 def _fmt_dt(dt: Optional[datetime]) -> str:
     return dt.strftime("%Y-%m-%d %H:%M %Z") if dt else "—"
 
-# ----------- (опційно) форматування для тг-джерел ------------
+# -------- форматування результатів parse_any (опційно) --------
 def format_events_daily(events: List["ListingEvent"]) -> str:
     if not events:
         return "Немає нових подій."
     events_sorted = sorted(
         events,
-        key=lambda e: (e.open_time.timestamp() if getattr(e, "open_time", None) else 0, e.exchange, e.market_type),
+        key=lambda e: (getattr(e, "open_time", datetime(1970,1,1)).timestamp(), getattr(e, "exchange", ""), getattr(e, "market_type", "")),
     )
     lines = []
     today = datetime.now(TZ).strftime("%d.%m")
     lines.append(f"*Listing {today}*")
     by_kind = {"alpha": [], "spot": [], "futures": [], "unknown": []}
     for e in events_sorted:
-        hhmm = e.open_time.strftime("%H:%M") if getattr(e, "open_time", None) else "--:--"
-        kind = e.market_type if getattr(e, "market_type", "unknown") in by_kind else "unknown"
-        by_kind[kind].append(f"{e.exchange} ({kind}) {hhmm}")
+        ot = getattr(e, "open_time", None)
+        hhmm = ot.strftime("%H:%M") if ot else "--:--"
+        kind = getattr(e, "market_type", "unknown")
+        if kind not in by_kind: kind = "unknown"
+        by_kind[kind].append(f"{getattr(e,'exchange','?')} ({kind}) {hhmm}")
     for k in ["alpha", "spot", "futures", "unknown"]:
         if by_kind[k]:
             lines.append("\n".join(f"• {row}" for row in by_kind[k]))
     return "\n\n".join(lines)
 
 def format_event_verbose(e: "ListingEvent") -> str:
-    parts = [f"*{e.exchange.upper()}* ({e.market_type})"]
-    if getattr(e, "symbol", ""):
-        parts.append(f"Pair: `{e.symbol}`")
-    if getattr(e, "open_time", None):
-        parts.append(f"Open: {e.open_time.strftime('%Y-%m-%d %H:%M %Z')}")
-    if getattr(e, "network", ""):
-        parts.append(f"Network: {e.network}")
-    if getattr(e, "contract", ""):
-        parts.append(f"Contract: `{e.contract}`")
-    if getattr(e, "price", ""):
-        parts.append(f"Price: ${e.price}")
+    parts = [f"*{getattr(e,'exchange','').upper()}* ({getattr(e,'market_type','')})"]
+    if getattr(e, "symbol", ""): parts.append(f"Pair: `{e.symbol}`")
+    if getattr(e, "open_time", None): parts.append(f"Open: {e.open_time.strftime('%Y-%m-%d %H:%M %Z')}")
+    if getattr(e, "network", ""): parts.append(f"Network: {e.network}")
+    if getattr(e, "contract", ""): parts.append(f"Contract: `{e.contract}`")
+    if getattr(e, "price", ""): parts.append(f"Price: ${e.price}")
     return "\n".join(parts)
 
 # -------------------- BOT (команди) -------------------
@@ -175,9 +173,9 @@ def build_bot_app():
     app.add_handler(CommandHandler("testpost", cmd_testpost))
     return app
 
-# -------------------- TELETHON WATCHER (опційно) -----
+# -------------------- TELETHON WATCHER (optional) ----
 async def run_watcher():
-    # якщо не користуєшся джерелами з Telegram — просто не запускай цю таску у main()
+    # якщо не треба слухати тг-канали — НЕ запускати цю таску в main()
     try:
         with open("sources.yml", "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
@@ -204,10 +202,7 @@ async def run_watcher():
             ch_id = event.chat_id
             msg_id = event.id
             # anti-dup
-            cur.execute(
-                "INSERT OR IGNORE INTO seen_messages(channel_id, msg_id) VALUES (?, ?)",
-                (ch_id, msg_id),
-            )
+            cur.execute("INSERT OR IGNORE INTO seen_messages(channel_id, msg_id) VALUES (?,?)", (ch_id, msg_id))
             conn.commit()
             cur.execute("SELECT changes()")
             if cur.fetchone()[0] == 0:
@@ -217,21 +212,19 @@ async def run_watcher():
             if not text:
                 return
 
-            # якщо є файл parser_patterns.py
+            events_list = []
             try:
-                events_list = parse_any(text, tz=TIMEZONE)  # type: ignore[name-defined]
+                events_list = parse_any(text, tz=TIMEZONE)  # type: ignore
             except Exception:
-                events_list = []
+                pass
 
             if not events_list:
                 return
 
-            if len(events_list) == 1 and (events_list[0].symbol or events_list[0].contract):
-                msg = format_event_verbose(events_list[0])
-                send_bot_message(msg)
+            if len(events_list) == 1 and (getattr(events_list[0], "symbol", "") or getattr(events_list[0], "contract", "")):
+                send_bot_message(format_event_verbose(events_list[0]))
             else:
-                msg = format_events_daily(events_list)
-                send_bot_message(msg)
+                send_bot_message(format_events_daily(events_list))
         except Exception as e:
             log.exception("Handler error: %s", e)
             send_owner(f"⚠️ Handler error: {e}")
@@ -247,17 +240,21 @@ async def poll_announcements_loop():
                     data = fetch()  # list[dict]
                     for a in data:
                         url = a["url"]
-                        cur.execute("SELECT 1 FROM seen_announcements WHERE url=?", (url,))
-                        if cur.fetchone():
-                            continue
-
                         start_ts = int(a["start_dt"].timestamp()) if a.get("start_dt") else None
+
+                        # запис і антидублі
                         cur.execute(
-                            "INSERT OR IGNORE INTO seen_announcements(url,exchange,market,title,symbols,start_ts) VALUES (?,?,?,?,?,?)",
+                            "INSERT OR IGNORE INTO seen_announcements(url,exchange,market,title,symbols,start_ts) "
+                            "VALUES (?,?,?,?,?,?)",
                             (url, a.get("exchange"), a.get("market"), a.get("title"),
                              ",".join(a.get("symbols", [])), start_ts)
                         )
                         conn.commit()
+
+                        # постимо ТІЛЬКИ якщо справді новий запис
+                        cur.execute("SELECT changes()")
+                        if cur.fetchone()[0] == 0:
+                            continue
 
                         lines = [
                             f"📣 *{a.get('exchange','').upper()}* — *{a.get('market','')}* listing announced",
@@ -271,6 +268,7 @@ async def poll_announcements_loop():
                         send_bot_message("\n".join(lines))
                 except Exception as e:
                     log.exception("ann-source error for %s: %s", getattr(fetch, "__name__", "src"), e)
+
             await asyncio.sleep(ANN_INTERVAL_SEC)
         except Exception as e:
             log.exception("ann loop error: %s", e)
@@ -287,7 +285,7 @@ async def main():
             await app.start()
             await app.updater.start_polling(drop_pending_updates=True)
 
-        # запусти те, що потрібно; якщо тг-джерела не потрібні — не створюй watcher_task
+        # TODO: якщо НЕ треба слухати тг-канали — залишай watcher_task закоментованим
         # watcher_task = asyncio.create_task(run_watcher())
         ann_task = asyncio.create_task(poll_announcements_loop())
 
@@ -295,7 +293,6 @@ async def main():
         if wait_tasks:
             await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_EXCEPTION)
         else:
-            # якщо нічого не запущено — просто не виходимо
             while True:
                 await asyncio.sleep(3600)
     finally:
