@@ -53,7 +53,7 @@ TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "")
 OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID", "")
 
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Kyiv")
-ANN_INTERVAL_SEC = int(os.getenv("ANN_INTERVAL_SEC", "180"))
+ANN_INTERVAL_SEC = int(os.getenv("ANN_INTERVAL_SEC", ""))
 
 TZ = pytz.timezone(TIMEZONE)
 
