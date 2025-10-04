@@ -1,0 +1,16 @@
+# venv
+.venv/
+# secrets
+.env
+# telethon session files
+*.session*
+hornet_session*
+# caches & local db
+__pycache__/
+state.db
+# editors
+.vscode/
+.idea/
+# os files
+Thumbs.db
+.DS_Store

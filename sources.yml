@@ -1,0 +1,10 @@
+# Список каналів-джерел, які слухає Telethon user client.
+# Можна вказувати @username або повне посилання t.me/...
+# Приклади з ваших скрінів (замініть/додайте свої):
+sources:
+  - https://t.me/gate_listings
+  - https://t.me/NewListingsFeed
+  - https://t.me/bitget_listings
+  - https://t.me/listings_mexc
+  - https://t.me/mexc_new_list
+
