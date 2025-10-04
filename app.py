@@ -266,13 +266,34 @@ async def poll_announcements_loop():
                         lines.append(f"🕒 Старт (Київ): {_fmt_dt(a.get('start_dt'))}")
                         lines.append(f"🔗 Джерело: {url}")
                         send_bot_message("\n".join(lines))
+
+                except requests.exceptions.HTTPError as e:
+                    code = getattr(getattr(e, "response", None), "status_code", None)
+                    if code == 403 or "403" in str(e):
+                        log.warning("ann-source http 403 for %s: %s",
+                                    getattr(fetch, "__name__", "src"), e)
+                        continue  # скіпаємо це джерело в цьому циклі
+                    log.exception("ann-source HTTP error for %s: %s",
+                                  getattr(fetch, "__name__", "src"), e)
+                    continue
+
+                except requests.exceptions.RequestException as e:
+                    # таймаути, DNS, конекти, 5xx без raise_for_status, тощо
+                    log.warning("ann-source network error for %s: %s",
+                                getattr(fetch, "__name__", "src"), e)
+                    continue
+
                 except Exception as e:
-                    log.exception("ann-source error for %s: %s", getattr(fetch, "__name__", "src"), e)
+                    log.exception("ann-source error for %s: %s",
+                                  getattr(fetch, "__name__", "src"), e)
+                    continue
 
             await asyncio.sleep(ANN_INTERVAL_SEC)
+
         except Exception as e:
             log.exception("ann loop error: %s", e)
             await asyncio.sleep(5)
+
 
 # -------------------- MAIN ---------------------------
 async def main():

@@ -8,9 +8,14 @@ import pytz
 
 UA_TZ = pytz.timezone("Europe/Kyiv")
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/126 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "uk-UA,ru-RU;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Referer": "https://www.google.com/"
 }
+
 
 # ------ утиліти ---------------------------------------------------------------
 # 2 шаблони: "час → дата" і "дата → час" (OKX), враховує UTC/GMT
@@ -108,7 +113,7 @@ def gate_collect(list_url: str, market: str) -> List[Dict[str, Any]]:
         href = a["href"]
         if "/announcements/detail" in href or "/announcements/article" in href:
             if not href.startswith("http"):
-                href = "https://www.gate.com" + href
+                href = "https://www.gate.io" + href
             arts.append(href)
     arts = uniq(arts)[:20]
     out = []
@@ -122,10 +127,13 @@ def gate_collect(list_url: str, market: str) -> List[Dict[str, Any]]:
     return out
 
 def gate_spot_latest() -> List[Dict[str, Any]]:
-    return gate_collect("https://www.gate.com/ru/announcements/newspotlistings", "spot")
+    # Було: gate.com
+    return gate_collect("https://www.gate.io/ru/announcements/newspotlistings", "spot")
 
 def gate_futures_latest() -> List[Dict[str, Any]]:
-    return gate_collect("https://www.gate.com/ru/announcements/newfutureslistings", "futures")
+    # Було: gate.com
+    return gate_collect("https://www.gate.io/ru/announcements/newfutureslistings", "futures")
+
 
 # ------ BINGX: spot / futures --------------------------------------------------
 def bingx_collect(section_url: str, market: str) -> List[Dict[str, Any]]:
