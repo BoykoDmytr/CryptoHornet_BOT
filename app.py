@@ -1,22 +1,39 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import os, asyncio, sqlite3, time, logging, json
+
+import os
+import asyncio
+import sqlite3
+import logging
+import sys
 from dataclasses import asdict
 from typing import List
 from datetime import datetime
-import pytz, yaml, requests
 
-from telethon import TelegramClient, events
+import pytz
+import yaml
+import requests
+
 from dotenv import load_dotenv
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession  # <-- для headless деплою
 
 from parser_patterns import parse_any, ListingEvent
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# ----------------------- ЛОГІНГ -----------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+
+# ----------------------- ENV --------------------------
 load_dotenv()
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
-SESSION_NAME = os.getenv("SESSION_NAME", "hornet_session")
+SESSION_NAME = os.getenv("SESSION_NAME", "hornet_session")  # локально
+SESSION_STRING = os.getenv("SESSION_STRING", "").strip()     # хмара
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "")  # e.g. -100123...
@@ -24,27 +41,26 @@ OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID", "")
 
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Kyiv")
 
-# --- DB for dedupe ---
+# ----------------------- DB DE-DUPE -------------------
 DB_PATH = "state.db"
 conn = sqlite3.connect(DB_PATH)
 cur = conn.cursor()
-cur.execute("""
-CREATE TABLE IF NOT EXISTS seen_messages(
-  channel_id INTEGER,
-  msg_id INTEGER,
-  PRIMARY KEY(channel_id, msg_id)
+cur.execute(
+    """
+    CREATE TABLE IF NOT EXISTS seen_messages(
+      channel_id INTEGER,
+      msg_id INTEGER,
+      PRIMARY KEY(channel_id, msg_id)
+    )
+    """
 )
-""")
 conn.commit()
 
-async def cmd_testpost(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    send_bot_message("✅ Test publish from Crypto Hornet bot.")
-    await update.message.reply_text("Відправив тест у TARGET_CHAT_ID.")
-
-
+# ----------------------- УТИЛІТИ ----------------------
 def send_bot_message(text: str, disable_preview: bool = True):
+    """Надіслати повідомлення у TARGET_CHAT_ID Bot API-методом."""
     if not BOT_TOKEN or not TARGET_CHAT_ID:
-        logging.warning("BOT_TOKEN or TARGET_CHAT_ID not set; skipping send.")
+        logging.warning("BOT_TOKEN або TARGET_CHAT_ID порожні — пропускаю send.")
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
@@ -61,6 +77,7 @@ def send_bot_message(text: str, disable_preview: bool = True):
         logging.exception("Bot send failed: %s", e)
 
 def send_owner(text: str):
+    """Сервісні алерти у приват власнику."""
     if not BOT_TOKEN or not OWNER_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -71,13 +88,12 @@ def send_owner(text: str):
         pass
 
 def format_events_daily(events: List[ListingEvent]) -> str:
-    """Форматування у стилі ваших скрінів (список біржа (тип) час)."""
+    """Форматування блоку у стилі скрінів (біржа (тип) час)."""
     if not events:
         return "Немає нових подій."
-    # Сортуємо за часом/біржею
     events_sorted = sorted(
         events,
-        key=lambda e: (e.open_time.timestamp() if e.open_time else 0, e.exchange, e.market_type)
+        key=lambda e: (e.open_time.timestamp() if e.open_time else 0, e.exchange, e.market_type),
     )
     lines = []
     today = datetime.now(pytz.timezone(TIMEZONE)).strftime("%d.%m")
@@ -85,14 +101,11 @@ def format_events_daily(events: List[ListingEvent]) -> str:
     by_kind = {"alpha": [], "spot": [], "futures": [], "unknown": []}
     for e in events_sorted:
         hhmm = e.open_time.strftime("%H:%M") if e.open_time else "--:--"
-        by_kind[e.market_type if e.market_type in by_kind else "unknown"].append(f"{e.exchange} ({e.market_type}) {hhmm}")
-    # Порядок як на скрінах приблизно
-    order = ["alpha", "spot", "futures", "unknown"]
-    for k in order:
-        if not by_kind[k]:
-            continue
-        block = "\n".join(f"• {row}" for row in by_kind[k])
-        lines.append(block)
+        kind = e.market_type if e.market_type in by_kind else "unknown"
+        by_kind[kind].append(f"{e.exchange} ({kind}) {hhmm}")
+    for k in ["alpha", "spot", "futures", "unknown"]:
+        if by_kind[k]:
+            lines.append("\n".join(f"• {row}" for row in by_kind[k]))
     return "\n\n".join(lines)
 
 def format_event_verbose(e: ListingEvent) -> str:
@@ -109,7 +122,7 @@ def format_event_verbose(e: ListingEvent) -> str:
         parts.append(f"Price: ${e.price}")
     return "\n".join(parts)
 
-# --- Bot polling for minimal commands (/ping, /sources) ---
+# -------------------- BOT (команди) -------------------
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -124,9 +137,15 @@ async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not srcs:
             await update.message.reply_text("sources.yml порожній.")
         else:
-            await update.message.reply_text("Джерела:\n" + "\n".join(f"• {s}" for s in srcs))
+            msg = "Джерела:\n" + "\n".join(f"• {s}" for s in srcs)
+            await update.message.reply_text(msg, disable_web_page_preview=True)
     except Exception as e:
         await update.message.reply_text(f"Помилка читання sources.yml: {e}")
+
+# опційна команда для швидкого тесту постингу
+async def cmd_testpost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    send_bot_message("✅ Test publish from Crypto Hornet bot.")
+    await update.message.reply_text("Відправив тест у TARGET_CHAT_ID.")
 
 def build_bot_app():
     if not BOT_TOKEN:
@@ -135,19 +154,34 @@ def build_bot_app():
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("sources", cmd_sources))
     app.add_handler(CommandHandler("testpost", cmd_testpost))
-
     return app
 
-# --- Telethon watcher ---
+# -------------------- TELETHON WATCHER ----------------
 async def run_watcher():
-    # Завантажуємо джерела
+    # 1) Завантажуємо джерела
     with open("sources.yml", "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
     sources = cfg.get("sources", [])
     if not sources:
         logging.warning("sources.yml is empty.")
-    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-    await client.start()
+
+    # 2) Ініціалізація Telethon-клієнта
+    if SESSION_STRING:
+        logging.info("Using Telethon StringSession")
+        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    else:
+        logging.info("Using file session (dev). Will prompt for login.")
+        client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+
+    await client.connect()
+
+    # 3) Перевірка авторизації (щоб не було input() у хмарі)
+    if not await client.is_user_authorized():
+        raise RuntimeError(
+            "SESSION_STRING is missing/invalid. Згенеруй локально make_session.py "
+            "та встанови змінну середовища SESSION_STRING."
+        )
+
     logging.info("Telethon started. Listening: %s", sources)
 
     @client.on(events.NewMessage(chats=sources if sources else None))
@@ -155,63 +189,76 @@ async def run_watcher():
         try:
             ch_id = event.chat_id
             msg_id = event.id
-            # dedupe
-            cur.execute("INSERT OR IGNORE INTO seen_messages(channel_id, msg_id) VALUES (?, ?)", (ch_id, msg_id))
+
+            # дедуплікація
+            cur.execute(
+                "INSERT OR IGNORE INTO seen_messages(channel_id, msg_id) VALUES (?, ?)",
+                (ch_id, msg_id),
+            )
             conn.commit()
-            # Якщо вже бачили — ігноруємо
             cur.execute("SELECT changes()")
             if cur.fetchone()[0] == 0:
+                return  # вже бачили
+
+            text = (event.message.message or "").strip()
+            if not text:
                 return
-            text = event.message.message or ""
-            if not text.strip():
-                return
+
             events_list = parse_any(text, tz=TIMEZONE)
             if not events_list:
-                return  # не схоже на лістинг
-            # Якщо це один деталізований евент (типу MEXC futures) — шлемо детально
+                return
+
+            # деталізований кейс
             if len(events_list) == 1 and (events_list[0].symbol or events_list[0].contract):
                 msg = format_event_verbose(events_list[0])
                 send_bot_message(msg)
             else:
-                # Групове форматування
+                # агреговане зведення
                 msg = format_events_daily(events_list)
                 send_bot_message(msg)
+
         except Exception as e:
             logging.exception("Handler error: %s", e)
             send_owner(f"⚠️ Handler error: {e}")
 
+    # 4) чекаємо поки клієнт не відключиться
     await client.run_until_disconnected()
 
+# -------------------- ГОЛОВНИЙ ЦИКЛ ------------------
 async def main():
     app = build_bot_app()
     watcher_task = None
     try:
         if app:
-            # 1) послідовно ініціалізуємо та стартуємо Application
+            # послідовний старт Application + polling
             await app.initialize()
             await app.start()
-            # 2) запускаємо polling для команд /ping, /sources
-            await app.updater.start_polling()
+            await app.updater.start_polling(drop_pending_updates=True)
 
-        # 3) Telethon-watcher працює паралельно (чекаємо, поки не від’єднається)
+        # Telethon watcher працює паралельно
         watcher_task = asyncio.create_task(run_watcher())
         await watcher_task
     finally:
-        # 4) акуратне вимкнення
+        # акуратне вимкнення
         if app:
             try:
                 await app.updater.stop()
             except Exception:
                 pass
-            await app.stop()
+            try:
+                await app.stop()
+            except Exception:
+                pass
             try:
                 await app.shutdown()
             except Exception:
                 pass
         if watcher_task:
-            watcher_task.cancel()
+            try:
+                watcher_task.cancel()
+            except Exception:
+                pass
 
-
-
+# -------------------- ENTRYPOINT ----------------------
 if __name__ == "__main__":
     asyncio.run(main())
