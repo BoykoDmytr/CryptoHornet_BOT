@@ -1,6 +1,7 @@
 # ann_sources.py
 from __future__ import annotations
 
+# на самому верху
 import os
 import re
 from typing import List, Dict, Any, Iterable, Optional
@@ -11,18 +12,31 @@ import pytz
 import requests
 from bs4 import BeautifulSoup
 
-# ---------- HTTP session / headers / proxy / scraper -------------------------
+# ⚠️ нове: для TLS-імперсонації Chrome
+try:
+    from curl_cffi import requests as curl_requests
+    HAS_CURL = True
+except Exception:
+    HAS_CURL = False
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/126.0 Safari/537.36"
+        "Chrome/126.0.0.0 Safari/537.36"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "uk-UA,ru-RU;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9,uk-UA;q=0.8,ru-RU;q=0.7",
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+    # “хромові” заголовки — часто вирішують саме 403 на MEXC/Gate
+    "Sec-Ch-Ua": '"Chromium";v="126", "Not.A/Brand";v="24", "Google Chrome";v="126"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-User": "?1",
+    "Sec-Fetch-Dest": "document",
     "Referer": "https://www.google.com/",
 }
 
@@ -33,25 +47,53 @@ HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
 HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
 PROXIES = {"http": HTTP_PROXY, "https": HTTPS_PROXY} if (HTTP_PROXY or HTTPS_PROXY) else None
 
-# Напр.: SCRAPER_URL="https://api.scraperapi.com?api_key=XXX&url"
+# опційно, якщо потім схочеш додати платний скрейпер: https://api.scraperapi.com?api_key=KEY&url
 SCRAPER_URL = os.getenv("SCRAPER_URL", "").rstrip("/")
 
 
-def _fetch(url: str, params: Dict[str, Any] | None = None) -> requests.Response:
-    if SCRAPER_URL:
-        # прокидаємо весь URL (разом із params) як параметр "url="
-        if params:
-            url = url + ("&" if "?" in url else "?") + urlencode(params)
-        final = f"{SCRAPER_URL}={quote(url, safe='')}"
-        r = SESSION.get(final, timeout=25, allow_redirects=True)
-    else:
-        r = SESSION.get(url, params=params, timeout=25, allow_redirects=True, proxies=PROXIES)
-    r.raise_for_status()
-    return r
 
+def _fetch(url: str, params: Dict[str, Any] | None = None):
+    # 1) прямий запит звичайним requests
+    try:
+        r = SESSION.get(url, params=params, timeout=25, allow_redirects=True, proxies=PROXIES)
+        r.raise_for_status()
+        return r
+    except requests.HTTPError as e:
+        code = getattr(e.response, "status_code", None)
+
+        # 2) якщо 403/503 — пробуємо TLS-імперсонацію реального Chrome
+        if code in (403, 503) and HAS_CURL:
+            try:
+                r2 = curl_requests.get(
+                    url,
+                    params=params,
+                    headers=HEADERS,
+                    impersonate="chrome124",   # або "chrome120"/"chrome110"
+                    timeout=25,
+                    proxies=PROXIES,
+                    http2=True,                # важливо — багато сайтів очікують h2
+                )
+                if r2.status_code == 200:
+                    return r2
+                r2.raise_for_status()
+            except Exception:
+                pass
+
+        # 3) останній шанс — зовнішній скрейпер (якщо заданий)
+        if code in (403, 503) and SCRAPER_URL:
+            q = url
+            if params:
+                q = url + ("&" if "?" in url else "?") + urlencode(params)
+            final = f"{SCRAPER_URL}={quote(q, safe='')}"
+            r3 = SESSION.get(final, timeout=25, allow_redirects=True)
+            r3.raise_for_status()
+            return r3
+
+        raise  # повертаємо початкову помилку
 
 def get_html(url: str, params: Dict[str, Any] | None = None) -> str:
     return _fetch(url, params=params).text
+
 
 
 # ---------- загальні утиліти --------------------------------------------------
@@ -131,8 +173,7 @@ def parse_dt_kiev(text: str) -> Optional[datetime]:
 # ---------- MEXC: лише FUTURES ------------------------------------------------
 
 def mexc_futures_latest(locale: Optional[str] = None) -> List[Dict[str, Any]]:
-    # Часто uk-UA блочать; дозволимо задавати локаль через ENV.
-    locale = locale or os.getenv("MEXC_LOCALE", "en-US")
+    locale = locale or os.getenv("MEXC_LOCALE", "en-US")  # було uk-UA
     base = f"https://www.mexc.com/{locale}/announcements/new-listings/19"
     soup = BeautifulSoup(get_html(base), "html.parser")
     links = []
