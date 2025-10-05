@@ -3,34 +3,23 @@ from __future__ import annotations
 
 import os
 import sys
-import yaml
+import time
 import random
+import yaml
+import pytz
 import asyncio
 import sqlite3
 import logging
+import requests
 from typing import List, Optional
 from datetime import datetime
 
 from dotenv import load_dotenv
-import pytz
-import requests
 
-# --- Telegram Bot API (команди/сервісні) ---
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# --- Telethon (опційно: моніторинг тг-каналів) ---
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
-
-# --- (опційно) локальний парсер для тг-постів ---
-try:
-    from parser_patterns import parse_any, ListingEvent  # type: ignore
-except Exception:
-    ListingEvent = object  # заглушка
-    def parse_any(*args, **kwargs): return []
-
-# --- парсери анонсів бірж ---
+# парсери біржових анонсів
 from ann_sources import sources_matrix
 
 # ----------------------- LOGGING -----------------------
@@ -44,31 +33,20 @@ log = logging.getLogger("hornet")
 # ----------------------- ENV --------------------------
 load_dotenv()
 
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-SESSION_NAME = os.getenv("SESSION_NAME", "hornet_session")
-SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
-
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "")
 OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID", "")
 
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Kyiv")
-ANN_INTERVAL_SEC = int(os.getenv("ANN_INTERVAL_SEC", ""))
+ANN_INTERVAL_SEC = int(os.getenv("ANN_INTERVAL_SEC", "180"))
 
 TZ = pytz.timezone(TIMEZONE)
 
 # ----------------------- DB ---------------------------
-DB_PATH = os.getenv("DB_PATH", "state.db")  # на Render: поставь /data/state.db (із підключеним Disk)
+DB_PATH = os.getenv("DB_PATH", "state.db")  # на Render: підключи Disk і постав /data/state.db
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS seen_messages(
-  channel_id INTEGER,
-  msg_id INTEGER,
-  PRIMARY KEY(channel_id, msg_id)
-)""")
 cur.execute("""
 CREATE TABLE IF NOT EXISTS seen_announcements(
   url TEXT PRIMARY KEY,
@@ -81,11 +59,20 @@ CREATE TABLE IF NOT EXISTS seen_announcements(
 conn.commit()
 
 # ----------------------- UTILS ------------------------
-def send_bot_message(text: str, disable_preview: bool = True):
-    """Надіслати повідомлення у TARGET_CHAT_ID через Bot API."""
+_last_send_ts = 0.0
+
+def send_bot_message(text: str, disable_preview: bool = True, max_retries: int = 3):
+    """
+    Безпечна відправка в канал:
+    - глобальний тротлінг (~1.2s між повідомленнями),
+    - повага до 429 retry_after,
+    - до 3 спроб.
+    """
+    global _last_send_ts
     if not BOT_TOKEN or not TARGET_CHAT_ID:
         log.warning("BOT_TOKEN або TARGET_CHAT_ID порожні — пропускаю send.")
         return
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TARGET_CHAT_ID,
@@ -93,56 +80,52 @@ def send_bot_message(text: str, disable_preview: bool = True):
         "parse_mode": "Markdown",
         "disable_web_page_preview": disable_preview,
     }
-    try:
-        r = requests.post(url, json=payload, timeout=20)
-        if r.status_code != 200:
-            log.error("Bot send error: %s %s", r.status_code, r.text)
-    except Exception as e:
-        log.exception("Bot send failed: %s", e)
+
+    # простий пер-чат ліміт ~1.2s
+    now = time.time()
+    gap = now - _last_send_ts
+    min_gap = 1.2
+    if gap < min_gap:
+        time.sleep(min_gap - gap)
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.post(url, json=payload, timeout=25)
+            if r.status_code == 200:
+                _last_send_ts = time.time()
+                return
+            if r.status_code == 429:
+                # поважаємо retry_after
+                try:
+                    j = r.json()
+                    wait = int(j.get("parameters", {}).get("retry_after", 3))
+                except Exception:
+                    wait = 3
+                wait += 1
+                log.error("Bot send 429. Waiting %ss (attempt %d/%d)", wait, attempt, max_retries)
+                time.sleep(wait)
+                continue
+            # інші коди — лог і вихід
+            log.error("Bot send error: %s %s", r.status_code, r.text[:500])
+            return
+        except Exception as e:
+            log.exception("Bot send failed (attempt %d/%d): %s", attempt, max_retries, e)
+            time.sleep(1 + attempt * 0.5 + random.random())
 
 def send_owner(text: str):
     if not BOT_TOKEN or not OWNER_CHAT_ID:
         return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": OWNER_CHAT_ID, "text": text}, timeout=20)
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": OWNER_CHAT_ID, "text": text},
+            timeout=20
+        )
     except Exception:
         pass
 
 def _fmt_dt(dt: Optional[datetime]) -> str:
     return dt.strftime("%Y-%m-%d %H:%M %Z") if dt else "—"
-
-# -------- форматування результатів parse_any (опційно) --------
-def format_events_daily(events: List["ListingEvent"]) -> str:
-    if not events:
-        return "Немає нових подій."
-    events_sorted = sorted(
-        events,
-        key=lambda e: (getattr(e, "open_time", datetime(1970,1,1)).timestamp(), getattr(e, "exchange", ""), getattr(e, "market_type", "")),
-    )
-    lines = []
-    today = datetime.now(TZ).strftime("%d.%m")
-    lines.append(f"*Listing {today}*")
-    by_kind = {"alpha": [], "spot": [], "futures": [], "unknown": []}
-    for e in events_sorted:
-        ot = getattr(e, "open_time", None)
-        hhmm = ot.strftime("%H:%M") if ot else "--:--"
-        kind = getattr(e, "market_type", "unknown")
-        if kind not in by_kind: kind = "unknown"
-        by_kind[kind].append(f"{getattr(e,'exchange','?')} ({kind}) {hhmm}")
-    for k in ["alpha", "spot", "futures", "unknown"]:
-        if by_kind[k]:
-            lines.append("\n".join(f"• {row}" for row in by_kind[k]))
-    return "\n\n".join(lines)
-
-def format_event_verbose(e: "ListingEvent") -> str:
-    parts = [f"*{getattr(e,'exchange','').upper()}* ({getattr(e,'market_type','')})"]
-    if getattr(e, "symbol", ""): parts.append(f"Pair: `{e.symbol}`")
-    if getattr(e, "open_time", None): parts.append(f"Open: {e.open_time.strftime('%Y-%m-%d %H:%M %Z')}")
-    if getattr(e, "network", ""): parts.append(f"Network: {e.network}")
-    if getattr(e, "contract", ""): parts.append(f"Contract: `{e.contract}`")
-    if getattr(e, "price", ""): parts.append(f"Price: ${e.price}")
-    return "\n".join(parts)
 
 # -------------------- BOT (команди) -------------------
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -174,66 +157,10 @@ def build_bot_app():
     app.add_handler(CommandHandler("testpost", cmd_testpost))
     return app
 
-# -------------------- TELETHON WATCHER (optional) ----
-async def run_watcher():
-    # якщо не треба слухати тг-канали — НЕ запускати цю таску в main()
-    try:
-        with open("sources.yml", "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-        sources = cfg.get("sources", [])
-    except Exception:
-        sources = []
-
-    if SESSION_STRING:
-        log.info("Using Telethon StringSession")
-        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-    else:
-        log.info("Using file session (dev). Will prompt for login.")
-        client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-
-    await client.connect()
-    if not await client.is_user_authorized():
-        raise RuntimeError("SESSION_STRING is missing/invalid. Згенеруй локально і встанови змінну середовища.")
-
-    log.info("Telethon started. Listening: %s", sources)
-
-    @client.on(events.NewMessage(chats=sources if sources else None))
-    async def handler(event):
-        try:
-            ch_id = event.chat_id
-            msg_id = event.id
-            # anti-dup
-            cur.execute("INSERT OR IGNORE INTO seen_messages(channel_id, msg_id) VALUES (?,?)", (ch_id, msg_id))
-            conn.commit()
-            cur.execute("SELECT changes()")
-            if cur.fetchone()[0] == 0:
-                return
-
-            text = (event.message.message or "").strip()
-            if not text:
-                return
-
-            events_list = []
-            try:
-                events_list = parse_any(text, tz=TIMEZONE)  # type: ignore
-            except Exception:
-                pass
-
-            if not events_list:
-                return
-
-            if len(events_list) == 1 and (getattr(events_list[0], "symbol", "") or getattr(events_list[0], "contract", "")):
-                send_bot_message(format_event_verbose(events_list[0]))
-            else:
-                send_bot_message(format_events_daily(events_list))
-        except Exception as e:
-            log.exception("Handler error: %s", e)
-            send_owner(f"⚠️ Handler error: {e}")
-
-    await client.run_until_disconnected()
-
 # -------------------- ANNOUNCEMENTS LOOP -------------
 async def poll_announcements_loop():
+    import requests as _rq  # локальний псевдонім для except
+
     while True:
         try:
             for fetch in sources_matrix():
@@ -275,16 +202,16 @@ async def poll_announcements_loop():
                         lines.append(f"🔗 Джерело: {url}")
                         send_bot_message("\n".join(lines))
 
-                except requests.exceptions.HTTPError as e:
+                except _rq.exceptions.HTTPError as e:
                     code = getattr(getattr(e, "response", None), "status_code", None)
-                    if code == 403 or "403" in str(e):
-                        log.warning("ann-source http 403 for %s: %s",
-                                    getattr(fetch, "__name__", "src"), e)
+                    if code in (403, 503) or "403" in str(e):
+                        log.warning("ann-source http %s for %s: %s",
+                                    code or "HTTPError", getattr(fetch, "__name__", "src"), e)
                     else:
                         log.exception("ann-source HTTP error for %s: %s",
                                       getattr(fetch, "__name__", "src"), e)
 
-                except requests.exceptions.RequestException as e:
+                except _rq.exceptions.RequestException as e:
                     log.warning("ann-source network error for %s: %s",
                                 getattr(fetch, "__name__", "src"), e)
 
@@ -302,35 +229,43 @@ async def poll_announcements_loop():
             log.exception("ann loop error: %s", e)
             await asyncio.sleep(5)
 
-
 # -------------------- MAIN ---------------------------
 async def main():
     app = build_bot_app()
-    watcher_task = None
     ann_task = None
     try:
         if app:
-            await app.initialize()
-            await app.start()
-            await app.updater.start_polling(drop_pending_updates=True)
+            # Ініціалізація і старт бота
+            try:
+                await app.initialize()
+                await app.start()
+                try:
+                    await app.updater.start_polling(drop_pending_updates=True)
+                except Exception as e:
+                    # Якщо інший інстанс уже поллінгить (409) — працюємо без команд
+                    if "Conflict" in str(e):
+                        log.warning("Updater conflict: already polling elsewhere, continue without commands.")
+                    else:
+                        raise
+            except Exception as e:
+                log.exception("Bot init failed: %s", e)
 
-        # TODO: якщо НЕ треба слухати тг-канали — залишай watcher_task закоментованим
-        # watcher_task = asyncio.create_task(run_watcher())
+        # цикл оголошень
         ann_task = asyncio.create_task(poll_announcements_loop())
 
-        wait_tasks = [t for t in (watcher_task, ann_task) if t]
+        # очікуємо завершення задач
+        wait_tasks = [t for t in (ann_task,) if t]
         if wait_tasks:
             await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_EXCEPTION)
         else:
             while True:
                 await asyncio.sleep(3600)
     finally:
-        for t in (watcher_task, ann_task):
-            if t:
-                try:
-                    t.cancel()
-                except Exception:
-                    pass
+        if ann_task:
+            try:
+                ann_task.cancel()
+            except Exception:
+                pass
         if app:
             try: await app.updater.stop()
             except Exception: pass
