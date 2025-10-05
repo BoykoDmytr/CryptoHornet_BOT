@@ -211,41 +211,36 @@ RE_TZ_LABEL = re.compile(
 RE_KYIV_LABEL = re.compile(r"(?P<t>\d{1,2}:\d{2})\s*\((?:за|по)\s*києвом\)", re.I)
 
 
-def parse_dt_and_display(text: str) -> Tuple[Optional[datetime], Optional[str]]:
-    """
-    Повертає:
-      - dt_kiev: datetime у Europe/Kyiv (для БД/антидубля)
-      - display: як у статті (напр. '11:30 UTC' чи '13:10 (за Києвом)'),
-        але лише якщо час валідний (0<=h<24, 0<=m<60)
-    """
-    t = " ".join((text or "").split())
+def _valid_hm(t: str) -> bool:
+    try:
+        h, m = t.split(":")
+        h = int(h); m = int(m)
+        return 0 <= h < 24 and 0 <= m < 60
+    except Exception:
+        return False
 
-    # 1) 'HH:MM <TZ>'
+def parse_dt_and_display(text: str) -> tuple[Optional[datetime], Optional[str]]:
+    t = " ".join(text.split())
+
     m = RE_TZ_LABEL.search(t)
-    if m:
-        h = int(m.group("h"))
-        mm = int(m.group("m"))
-        if 0 <= h <= 23 and 0 <= mm <= 59:
-            disp = f"{h:02d}:{mm:02d} {m.group('label').upper()}"
-            dt = parse_dt_kiev(t)  # конвертує в Київ, якщо була дата + UTC/GMT
-            return dt, disp
+    if m and _valid_hm(m.group('t')):
+        disp = f"{m.group('t')} {m.group('label').upper()}"
+        dt = parse_dt_kiev(t)
+        return dt, disp
 
-    # 2) 'HH:MM (за Києвом)'
     m2 = RE_KYIV_LABEL.search(t)
-    if m2:
+    if m2 and _valid_hm(m2.group('t')):
         disp = f"{m2.group('t')} (за Києвом)"
         dt = parse_dt_kiev(t)
         return dt, disp
 
-    # 3) універсально (якщо в тексті є і дата, і час)
     dt = parse_dt_kiev(t)
     if dt:
-        if " utc" in t.lower():
-            disp = f"{dt.astimezone(pytz.utc).strftime('%H:%M')} UTC"
+        # якщо в тексті згаданий UTC/GMT — виведемо його, інакше локальний
+        if " utc" in t.lower() or " gmt" in t.lower():
+            return dt, f"{dt.astimezone(pytz.utc).strftime('%Y-%m-%d %H:%M')} UTC"
         else:
-            disp = dt.strftime("%H:%M")
-        return dt, disp
-
+            return dt, dt.strftime("%Y-%m-%d %H:%M")
     return None, None
 
 
@@ -307,100 +302,50 @@ def extract_meta_dt(soup: BeautifulSoup) -> Optional[datetime]:
 # ------ MEXC: лише FUTURES ----------------------------------------------------
 
 def mexc_futures_latest(locale: Optional[str] = None) -> List[Dict[str, Any]]:
-    """
-    MEXC Futures: витягаємо посилання і з <a>, і з вбудованого window.__NUXT__ JSON.
-    Падаємо назад на різні локалі, поки не знайдемо хоч щось.
-    """
-    locales_try: List[str] = []
-    if locale or os.getenv("MEXC_LOCALE"):
-        locales_try.append(locale or os.getenv("MEXC_LOCALE"))
-    for loc in ("en-US", "ru-RU", "uk-UA"):
-        if loc not in locales_try:
-            locales_try.append(loc)
-
-    links: set[str] = set()
-
-    for loc in locales_try:
-        base = f"https://www.mexc.com/{loc}/announcements/new-listings/19"
-        html = get_html(base)
-
-        # А) пробуємо <a>
-        soup = BeautifulSoup(html, "html.parser")
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if ("/announcements/article" in href) or ("/announcements/detail" in href):
-                if not href.startswith("http"):
-                    href = f"https://www.mexc.com/{loc}{href if href.startswith('/') else '/' + href}"
-                links.add(href)
-
-        # Б) window.__NUXT__
-        if len(links) < 5:
-            m = re.search(r"window\.__NUXT__\s*=\s*({.*?})\s*;</script>", html, re.S)
-            if m:
-                try:
-                    nuxt = json.loads(m.group(1))
-                except Exception:
-                    nuxt = None
-
-                ids: set[str] = set()
-
-                def walk(x):
-                    if isinstance(x, dict):
-                        if "articleId" in x:
-                            try:
-                                ids.add(str(x["articleId"]))
-                            except Exception:
-                                pass
-                        for v in x.values():
-                            walk(v)
-                    elif isinstance(x, list):
-                        for v in x:
-                            walk(v)
-
-                if nuxt:
-                    walk(nuxt)
-                    for aid in ids:
-                        links.add(f"https://www.mexc.com/{loc}/announcements/article/{aid}")
-
-            # В) ще regex «articleId»
-            if len(links) < 5:
-                for aid in re.findall(r'"articleId"\s*:\s*"?(\d+)"?', html):
-                    links.add(f"https://www.mexc.com/{loc}/announcements/article/{aid}")
-
-        if links:
-            break
-
-    if not links:
-        return []
+    # Використовуємо тег #Futures, бо new-listings/19 іноді віддає урізаний список
+    base = "https://www.mexc.com/announcements/tag/19"
+    soup = BeautifulSoup(get_html(base), "html.parser")
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/announcements/article/" in href:
+            if not href.startswith("http"):
+                href = "https://www.mexc.com" + (href if href.startswith("/") else "/" + href)
+            links.append(href)
+    links = uniq(links)[:20]
 
     out: List[Dict[str, Any]] = []
-    for u in list(links)[:30]:
+    for u in links:
         s = BeautifulSoup(get_html(u), "html.parser")
         title = s.find("h1").get_text(" ", strip=True) if s.find("h1") else ""
         plain = s.get_text(" ", strip=True)
         syms = extract_symbols(plain)
         dt, disp = parse_dt_and_display(plain)
-        if dt is None:
-            dt = extract_meta_dt(s)  # хоч дата публікації
         out.append({"exchange": "mexc", "market": "futures", "title": title, "symbols": syms,
                     "start_dt": dt, "start_text": disp, "url": u})
     return out
 
 
+
 # ------ GATE: spot / futures (fallback-и .io/.com і ru/en) --------------------
 
 def gate_collect(market: str) -> List[Dict[str, Any]]:
-    # Спробуємо кілька сторінок — першу, що віддасть 200, парсимо
-    candidates = [
-        ("https://www.gate.io/ru/announcements/newspotlistings", "https://www.gate.io") if market == "spot"
-        else ("https://www.gate.io/ru/announcements/newfutureslistings", "https://www.gate.io"),
-        ("https://www.gate.io/en/announcements/newspotlistings", "https://www.gate.io") if market == "spot"
-        else ("https://www.gate.io/en/announcements/newfutureslistings", "https://www.gate.io"),
-        ("https://www.gate.com/ru/announcements/newspotlistings", "https://www.gate.com") if market == "spot"
-        else ("https://www.gate.com/ru/announcements/newfutureslistings", "https://www.gate.com"),
-        ("https://www.gate.com/en/announcements/newspotlistings", "https://www.gate.com") if market == "spot"
-        else ("https://www.gate.com/en/announcements/newfutureslistings", "https://www.gate.com"),
-    ]
+    # Спочатку — EN на gate.com (оновлюється швидше), потім gate.io, і лише потім RU
+    if market == "spot":
+        candidates = [
+            ("https://www.gate.com/en/announcements/newlisted", "https://www.gate.com"),
+            ("https://www.gate.io/en/announcements/newspotlistings", "https://www.gate.io"),
+            ("https://www.gate.com/ru/announcements/newspotlistings", "https://www.gate.com"),
+            ("https://www.gate.io/ru/announcements/newspotlistings", "https://www.gate.io"),
+        ]
+    else:
+        candidates = [
+            ("https://www.gate.com/en/announcements/newfutureslistings", "https://www.gate.com"),
+            ("https://www.gate.io/en/announcements/newfutureslistings", "https://www.gate.io"),
+            ("https://www.gate.com/ru/announcements/newfutureslistings", "https://www.gate.com"),
+            ("https://www.gate.io/ru/announcements/newfutureslistings", "https://www.gate.io"),
+        ]
+
     html = None
     base_domain = None
     for u, dom in candidates:
@@ -413,7 +358,7 @@ def gate_collect(market: str) -> List[Dict[str, Any]]:
                 continue
             raise
     if html is None:
-        raise requests.HTTPError("403/blocked on all Gate endpoints")  # підхопиться верхнім try/except
+        raise requests.HTTPError("403/blocked on all Gate endpoints")
 
     soup = BeautifulSoup(html, "html.parser")
     arts = []
@@ -432,11 +377,10 @@ def gate_collect(market: str) -> List[Dict[str, Any]]:
         plain = s.get_text(" ", strip=True)
         syms = extract_symbols(plain)
         dt, disp = parse_dt_and_display(plain)
-        if dt is None:
-            dt = extract_meta_dt(s)
         out.append({"exchange": "gate", "market": market, "title": title, "symbols": syms,
                     "start_dt": dt, "start_text": disp, "url": u})
     return out
+
 
 
 def gate_spot_latest() -> List[Dict[str, Any]]:

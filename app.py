@@ -293,20 +293,19 @@ async def main():
     ann_task = None
     try:
         if app:
-            # Ініціалізація і старт бота
-            try:
-                await app.initialize()
-                await app.start()
+            await app.initialize()
+            await app.start()
+            # ⬇ керуємо поллінгом через ENV, щоб на проді не було 409
+            if os.getenv("ENABLE_POLLING", "0") == "1":
                 try:
                     await app.updater.start_polling(drop_pending_updates=True)
                 except Exception as e:
-                    # Якщо інший інстанс уже поллінгить (409) — працюємо без команд
                     if "Conflict" in str(e):
-                        log.warning("Updater conflict: already polling elsewhere, continue without commands.")
+                        log.warning("Updater conflict: polling elsewhere; running without commands.")
                     else:
                         raise
-            except Exception as e:
-                log.exception("Bot init failed: %s", e)
+                except Exception as e:
+                    log.exception("Bot init failed: %s", e)
 
         # цикл оголошень
         ann_task = asyncio.create_task(poll_announcements_loop())
