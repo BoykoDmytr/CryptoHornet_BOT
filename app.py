@@ -11,6 +11,11 @@ import asyncio
 import sqlite3
 import logging
 import requests
+from html import escape as html_escape
+# ParseMode імпортувати не обов’язково, бо ми шлемо напряму через HTTP
+# від Telegram, але залишу — раптом знадобиться в майбутньому:
+from telegram.constants import ParseMode  # noqa: F401
+
 from typing import List, Optional
 from datetime import datetime
 
@@ -43,7 +48,7 @@ ANN_INTERVAL_SEC = int(os.getenv("ANN_INTERVAL_SEC", "180"))
 TZ = pytz.timezone(TIMEZONE)
 
 # ----------------------- DB ---------------------------
-DB_PATH = os.getenv("DB_PATH", "state.db")  # на Render: підключи Disk і постав /data/state.db
+DB_PATH = os.getenv("DB_PATH", "state.db")  # на Railway/Render підключи Disk і постав /data/state.db
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
 
@@ -61,12 +66,14 @@ conn.commit()
 # ----------------------- UTILS ------------------------
 _last_send_ts = 0.0
 
+
 def send_bot_message(text: str, disable_preview: bool = True, max_retries: int = 3):
     """
     Безпечна відправка в канал:
     - глобальний тротлінг (~1.2s між повідомленнями),
     - повага до 429 retry_after,
-    - до 3 спроб.
+    - до 3 спроб,
+    - РОЗМІТКА: HTML + повне екранування контенту вже зроблено при складанні тексту.
     """
     global _last_send_ts
     if not BOT_TOKEN or not TARGET_CHAT_ID:
@@ -77,7 +84,7 @@ def send_bot_message(text: str, disable_preview: bool = True, max_retries: int =
     payload = {
         "chat_id": TARGET_CHAT_ID,
         "text": text,
-        "parse_mode": "Markdown",
+        "parse_mode": "HTML",               # <— важливо: HTML, не Markdown
         "disable_web_page_preview": disable_preview,
     }
 
@@ -112,6 +119,7 @@ def send_bot_message(text: str, disable_preview: bool = True, max_retries: int =
             log.exception("Bot send failed (attempt %d/%d): %s", attempt, max_retries, e)
             time.sleep(1 + attempt * 0.5 + random.random())
 
+
 def send_owner(text: str):
     if not BOT_TOKEN or not OWNER_CHAT_ID:
         return
@@ -124,12 +132,15 @@ def send_owner(text: str):
     except Exception:
         pass
 
+
 def _fmt_dt(dt: Optional[datetime]) -> str:
     return dt.strftime("%Y-%m-%d %H:%M %Z") if dt else "—"
+
 
 # -------------------- BOT (команди) -------------------
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
+
 
 async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -144,9 +155,11 @@ async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Помилка читання sources.yml: {e}")
 
+
 async def cmd_testpost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     send_bot_message("✅ Test publish from Crypto Hornet bot.")
     await update.message.reply_text("Відправив тест у TARGET_CHAT_ID.")
+
 
 def build_bot_app():
     if not BOT_TOKEN:
@@ -156,6 +169,7 @@ def build_bot_app():
     app.add_handler(CommandHandler("sources", cmd_sources))
     app.add_handler(CommandHandler("testpost", cmd_testpost))
     return app
+
 
 # -------------------- ANNOUNCEMENTS LOOP -------------
 async def poll_announcements_loop():
@@ -184,23 +198,36 @@ async def poll_announcements_loop():
                         if cur.fetchone()[0] == 0:
                             continue
 
+                        # ---------- будуємо безпечне HTML-повідомлення ----------
+                        ex = html_escape((a.get("exchange") or "").upper())
+                        market = html_escape(a.get("market") or "")
+                        title = html_escape(a.get("title") or "")
+                        src_url = html_escape(a.get("url") or "")
+
+                        # символи (фільтруємо технічні токени)
+                        raw_syms = a.get("symbols") or []
+                        syms = [s for s in raw_syms if s.upper() not in {"USDT", "FUTURES"}]
+
                         lines = [
-                            f"📣 *{a.get('exchange','').upper()}* — *{a.get('market','')}* listing announced",
-                            f"📝 {a.get('title','')}",
+                            f"📣 <b>{ex}</b> — <b>{market}</b> listing announced",
+                            f"📝 {title}",
                         ]
-                        syms = a.get("symbols") or []
                         if syms:
-                            lines.append("Пари:\n" + "\n".join(f"• `{s}/USDT`" for s in syms))
+                            lines.append(
+                                "Пари:\n" + "\n".join(f"• <code>{html_escape(s)}/USDT</code>" for s in syms)
+                            )
 
                         # час: спершу як у статті, інакше фолбек на Київ
                         start_text = a.get("start_text")
                         if start_text:
-                            lines.append(f"🕒 Старт: {start_text}")
+                            lines.append(f"🕒 Старт: {html_escape(start_text)}")
                         else:
                             lines.append(f"🕒 Старт (Київ): {_fmt_dt(a.get('start_dt'))}")
 
-                        lines.append(f"🔗 Джерело: {url}")
+                        lines.append(f"🔗 Джерело: {src_url}")
+
                         send_bot_message("\n".join(lines))
+                        # --------------------------------------------------------
 
                 except _rq.exceptions.HTTPError as e:
                     code = getattr(getattr(e, "response", None), "status_code", None)
@@ -228,6 +255,7 @@ async def poll_announcements_loop():
         except Exception as e:
             log.exception("ann loop error: %s", e)
             await asyncio.sleep(5)
+
 
 # -------------------- MAIN ---------------------------
 async def main():
@@ -267,12 +295,19 @@ async def main():
             except Exception:
                 pass
         if app:
-            try: await app.updater.stop()
-            except Exception: pass
-            try: await app.stop()
-            except Exception: pass
-            try: await app.shutdown()
-            except Exception: pass
+            try:
+                await app.updater.stop()
+            except Exception:
+                pass
+            try:
+                await app.stop()
+            except Exception:
+                pass
+            try:
+                await app.shutdown()
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
     asyncio.run(main())

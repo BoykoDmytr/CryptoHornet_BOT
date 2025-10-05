@@ -187,6 +187,7 @@ RE_TZ_LABEL = re.compile(
 )
 RE_KYIV_LABEL = re.compile(r"(?P<t>\d{1,2}:\d{2})\s*\((?:за|по)\s*києвом\)", re.I)
 
+
 def parse_dt_and_display(text: str) -> tuple[Optional[datetime], Optional[str]]:
     """
     Повертає:
@@ -294,8 +295,10 @@ def gate_collect(market: str) -> List[Dict[str, Any]]:
                     "start_dt": dt, "start_text": disp, "url": u})
     return out
 
+
 def gate_spot_latest() -> List[Dict[str, Any]]:
     return gate_collect("spot")
+
 
 def gate_futures_latest() -> List[Dict[str, Any]]:
     return gate_collect("futures")
@@ -323,8 +326,10 @@ def bingx_collect(section_url: str, market: str) -> List[Dict[str, Any]]:
                     "start_dt": dt, "start_text": disp, "url": u})
     return out
 
+
 def bingx_spot_latest() -> List[Dict[str, Any]]:
     return bingx_collect("https://bingx.com/en/support/notice-center/11257060005007", "spot")
+
 
 def bingx_futures_latest() -> List[Dict[str, Any]]:
     return bingx_collect("https://bingx.com/en/support/notice-center/11257015822991", "futures")
@@ -352,8 +357,10 @@ def bitget_collect(section_url: str, market: str) -> List[Dict[str, Any]]:
                     "start_dt": dt, "start_text": disp, "url": u})
     return out
 
+
 def bitget_spot_latest() -> List[Dict[str, Any]]:
     return bitget_collect("https://www.bitget.com/en/support/sections/5955813039257", "spot")
+
 
 def bitget_futures_latest() -> List[Dict[str, Any]]:
     return bitget_collect("https://www.bitget.com/en/support/sections/12508313405000", "futures")
@@ -365,6 +372,7 @@ def _title_is_listing(title: str) -> bool:
         return False
     t = title.strip().lstrip("[]()【】—-–·* ").lower()
     return t.startswith(("лістинг", "листинг", "listing"))
+
 
 def okx_latest() -> List[Dict[str, Any]]:
     url = "https://www.okx.com/ua/help/section/announcements-new-listings"
