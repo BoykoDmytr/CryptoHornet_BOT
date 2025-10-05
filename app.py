@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import yaml
+import random
 import asyncio
 import sqlite3
 import logging
@@ -263,7 +264,14 @@ async def poll_announcements_loop():
                         syms = a.get("symbols") or []
                         if syms:
                             lines.append("Пари:\n" + "\n".join(f"• `{s}/USDT`" for s in syms))
-                        lines.append(f"🕒 Старт (Київ): {_fmt_dt(a.get('start_dt'))}")
+
+                        # час: спершу як у статті, інакше фолбек на Київ
+                        start_text = a.get("start_text")
+                        if start_text:
+                            lines.append(f"🕒 Старт: {start_text}")
+                        else:
+                            lines.append(f"🕒 Старт (Київ): {_fmt_dt(a.get('start_dt'))}")
+
                         lines.append(f"🔗 Джерело: {url}")
                         send_bot_message("\n".join(lines))
 
@@ -272,21 +280,21 @@ async def poll_announcements_loop():
                     if code == 403 or "403" in str(e):
                         log.warning("ann-source http 403 for %s: %s",
                                     getattr(fetch, "__name__", "src"), e)
-                        continue  # скіпаємо це джерело в цьому циклі
-                    log.exception("ann-source HTTP error for %s: %s",
-                                  getattr(fetch, "__name__", "src"), e)
-                    continue
+                    else:
+                        log.exception("ann-source HTTP error for %s: %s",
+                                      getattr(fetch, "__name__", "src"), e)
 
                 except requests.exceptions.RequestException as e:
-                    # таймаути, DNS, конекти, 5xx без raise_for_status, тощо
                     log.warning("ann-source network error for %s: %s",
                                 getattr(fetch, "__name__", "src"), e)
-                    continue
 
                 except Exception as e:
                     log.exception("ann-source error for %s: %s",
                                   getattr(fetch, "__name__", "src"), e)
-                    continue
+
+                finally:
+                    # невелика пауза між сайтами, щоб менше trigger’ити захисти
+                    await asyncio.sleep(0.6 + random.random() * 0.7)
 
             await asyncio.sleep(ANN_INTERVAL_SEC)
 
