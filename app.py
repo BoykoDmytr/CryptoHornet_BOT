@@ -120,6 +120,68 @@ def send_bot_message(text: str, disable_preview: bool = True, max_retries: int =
             log.exception("Bot send failed (attempt %d/%d): %s", attempt, max_retries, e)
             time.sleep(1 + attempt * 0.5 + random.random())
 
+def send_chat_message(chat_id: str, text: str, disable_preview: bool = True, max_retries: int = 3):
+    """Надсилання повідомлення у довільний chat_id (використовується для /preview і /backfill)."""
+    global _last_send_ts
+    if not BOT_TOKEN or not chat_id:
+        log.warning("BOT_TOKEN або chat_id порожні — пропускаю send.")
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": disable_preview,
+    }
+    now = time.time()
+    gap = now - _last_send_ts
+    min_gap = 1.2
+    if gap < min_gap:
+        time.sleep(min_gap - gap)
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.post(url, json=payload, timeout=25)
+            if r.status_code == 200:
+                _last_send_ts = time.time()
+                return
+            if r.status_code == 429:
+                try:
+                    j = r.json()
+                    wait = int(j.get("parameters", {}).get("retry_after", 3))
+                except Exception:
+                    wait = 3
+                wait += 1
+                log.error("Bot send 429. Waiting %ss (attempt %d/%d)", wait, attempt, max_retries)
+                time.sleep(wait)
+                continue
+            log.error("Bot send error: %s %s", r.status_code, r.text[:500])
+            return
+        except Exception as e:
+            log.exception("Bot send failed (attempt %d/%d): %s", attempt, max_retries, e)
+            time.sleep(1 + attempt * 0.5 + random.random())
+
+
+def _fmt_msg(a: dict) -> str:
+    lines = [
+        f"📣 *{(a.get('exchange') or '').upper()}* — *{a.get('market','')}* listing announced",
+        f"📝 {a.get('title','')}",
+    ]
+    syms = a.get("symbols") or []
+    if syms:
+        lines.append("Пари:\n" + "\n".join(f"• `{s}/USDT`" for s in syms))
+
+    # пріоритет: як в статті → інакше Київ з датою
+    start_text = a.get("start_text")
+    if start_text:
+        lines.append(f"🕒 Старт: {start_text}")
+    else:
+        dt = a.get("start_dt")
+        lines.append(f"🕒 Старт (Київ): {_fmt_dt(dt)}")
+
+    lines.append(f"🔗 Джерело: {a.get('url')}")
+    return "\n".join(lines)
+
 
 def send_owner(text: str):
     if not BOT_TOKEN or not OWNER_CHAT_ID:
@@ -161,6 +223,91 @@ async def cmd_testpost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     send_bot_message("✅ Test publish from Crypto Hornet bot.")
     await update.message.reply_text("Відправив тест у TARGET_CHAT_ID.")
 
+# ---- Імпортуємо конкретні джерела для ручного виклику
+from ann_sources import (
+    mexc_futures_latest,
+    gate_spot_latest, gate_futures_latest,
+    bingx_spot_latest, bingx_futures_latest,
+    bitget_spot_latest, bitget_futures_latest,
+    okx_latest, binance_latest,
+)
+
+SOURCES_MAP = {
+    "mexc_fut": mexc_futures_latest,
+    "gate_spot": gate_spot_latest,
+    "gate_fut": gate_futures_latest,
+    "bingx_spot": bingx_spot_latest,
+    "bingx_fut": bingx_futures_latest,
+    "bitget_spot": bitget_spot_latest,
+    "bitget_fut": bitget_futures_latest,
+    "okx": okx_latest,
+    "binance": binance_latest,
+}
+SOURCES_ALL_ORDER = [
+    "mexc_fut", "gate_spot", "gate_fut",
+    "bingx_spot", "bingx_fut",
+    "bitget_spot", "bitget_fut",
+    "okx", "binance",
+]
+
+def _is_owner(update: Update) -> bool:
+    try:
+        return str(update.effective_user.id) == str(OWNER_CHAT_ID)
+    except Exception:
+        return False
+
+async def _run_manual_fetch_and_send(target_chat: str, src_key: str, n: int):
+    if src_key == "all":
+        keys = SOURCES_ALL_ORDER
+    else:
+        if src_key not in SOURCES_MAP:
+            send_chat_message(target_chat, f"❌ Невідоме джерело: `{src_key}`. Варіанти: " + ", ".join(SOURCES_ALL_ORDER))
+            return
+        keys = [src_key]
+
+    total = 0
+    for k in keys:
+        fetch = SOURCES_MAP[k]
+        try:
+            data = fetch()  # list[dict]
+        except Exception as e:
+            send_chat_message(target_chat, f"⚠️ {k}: помилка завантаження: {e}")
+            await asyncio.sleep(1.0)
+            continue
+
+        # беремо перші n (вони вже «найсвіжіші» за розміткою сторінки)
+        items = data[:max(1, n)]
+        if not items:
+            send_chat_message(target_chat, f"ℹ️ {k}: порожньо.")
+            await asyncio.sleep(0.8)
+            continue
+
+        for a in items:
+            msg = _fmt_msg(a)
+            send_chat_message(target_chat, msg)
+            total += 1
+            await asyncio.sleep(1.3)  # обережний тротлінг
+
+    send_chat_message(target_chat, f"✅ Готово. Відправлено {total} повідомлень із: {', '.join(keys)}")
+
+async def cmd_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update):
+        return
+    args = context.args or []
+    src = (args[0].lower() if args else "all")
+    n = int(args[1]) if len(args) >= 2 and args[1].isdigit() else 3
+    await _run_manual_fetch_and_send(str(OWNER_CHAT_ID), src, n)
+
+async def cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update):
+        return
+    args = context.args or []
+    src = (args[0].lower() if args else "all")
+    n = int(args[1]) if len(args) >= 2 and args[1].isdigit() else 3
+    dest = (args[2].lower() if len(args) >= 3 else "channel")
+    chat_id = TARGET_CHAT_ID if dest in ("channel", "chan") else str(OWNER_CHAT_ID)
+    await _run_manual_fetch_and_send(chat_id, src, n)
+
 
 def build_bot_app():
     if not BOT_TOKEN:
@@ -169,7 +316,10 @@ def build_bot_app():
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("sources", cmd_sources))
     app.add_handler(CommandHandler("testpost", cmd_testpost))
+    app.add_handler(CommandHandler("preview", cmd_preview))
+    app.add_handler(CommandHandler("backfill", cmd_backfill))
     return app
+
 
 
 # -------------------- ANNOUNCEMENTS LOOP -------------
