@@ -12,12 +12,9 @@ import sqlite3
 import logging
 import requests
 from html import escape as html_escape
-# ParseMode імпортувати не обов’язково, бо ми шлемо напряму через HTTP
-# від Telegram, але залишу — раптом знадобиться в майбутньому:
-from telegram.constants import ParseMode  # noqa: F401
 
-from typing import List, Optional
-from datetime import datetime
+from typing import Optional
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 
@@ -44,6 +41,10 @@ OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID", "")
 
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Kyiv")
 ANN_INTERVAL_SEC = int(os.getenv("ANN_INTERVAL_SEC", "180"))
+
+# Фільтр дат
+POST_DAYS_BACK = int(os.getenv("POST_DAYS_BACK", "1"))   # приймаємо від сьогодні і N днів назад (деф. 1 = вчора)
+ALLOW_NO_DATE  = os.getenv("ALLOW_NO_DATE", "0") == "1"  # дозволити постити без дати (деф. 0)
 
 TZ = pytz.timezone(TIMEZONE)
 
@@ -73,7 +74,7 @@ def send_bot_message(text: str, disable_preview: bool = True, max_retries: int =
     - глобальний тротлінг (~1.2s між повідомленнями),
     - повага до 429 retry_after,
     - до 3 спроб,
-    - РОЗМІТКА: HTML + повне екранування контенту вже зроблено при складанні тексту.
+    - РОЗМІТКА: HTML (контент попередньо екрануємо).
     """
     global _last_send_ts
     if not BOT_TOKEN or not TARGET_CHAT_ID:
@@ -84,7 +85,7 @@ def send_bot_message(text: str, disable_preview: bool = True, max_retries: int =
     payload = {
         "chat_id": TARGET_CHAT_ID,
         "text": text,
-        "parse_mode": "HTML",               # <— важливо: HTML, не Markdown
+        "parse_mode": "HTML",               # важливо: HTML, не Markdown
         "disable_web_page_preview": disable_preview,
     }
 
@@ -177,14 +178,39 @@ async def poll_announcements_loop():
 
     while True:
         try:
+            # оновлюємо «зріз» часу на кожну головну ітерацію
+            now_kiev = datetime.now(TZ)
+            cutoff_date = (now_kiev - timedelta(days=POST_DAYS_BACK)).date()
+
             for fetch in sources_matrix():
                 try:
                     data = fetch()  # list[dict]
+                    name = getattr(fetch, "__name__", "src")
+                    log.info("source %s: %d items", name, len(data) if data else 0)
+
                     for a in data:
                         url = a["url"]
-                        start_ts = int(a["start_dt"].timestamp()) if a.get("start_dt") else None
+                        start_dt = a.get("start_dt")  # datetime або None
+
+                        # ---- ФІЛЬТР ДАТ ----
+                        # 1) якщо дати немає — або скіпаємо, або дозволяємо (через ALLOW_NO_DATE)
+                        if start_dt is None and not ALLOW_NO_DATE:
+                            log.info("skip (no date) %s", url)
+                            continue
+
+                        # 2) якщо дата є, але старіша за cutoff — скіпаємо
+                        if start_dt is not None:
+                            try:
+                                dt_date = start_dt.astimezone(TZ).date()
+                            except Exception:
+                                dt_date = start_dt.date()
+                            if dt_date < cutoff_date:
+                                log.info("skip old (%s < %s) %s", dt_date, cutoff_date, url)
+                                continue
+                        # ---- кінець фільтра ----
 
                         # запис і антидублі
+                        start_ts = int(start_dt.timestamp()) if start_dt else None
                         cur.execute(
                             "INSERT OR IGNORE INTO seen_announcements(url,exchange,market,title,symbols,start_ts) "
                             "VALUES (?,?,?,?,?,?)",
@@ -206,7 +232,7 @@ async def poll_announcements_loop():
 
                         # символи (фільтруємо технічні токени)
                         raw_syms = a.get("symbols") or []
-                        syms = [s for s in raw_syms if s.upper() not in {"USDT", "FUTURES"}]
+                        syms = [s for s in raw_syms if s and s.upper() not in {"USDT", "FUTURES"}]
 
                         lines = [
                             f"📣 <b>{ex}</b> — <b>{market}</b> listing announced",
@@ -217,12 +243,16 @@ async def poll_announcements_loop():
                                 "Пари:\n" + "\n".join(f"• <code>{html_escape(s)}/USDT</code>" for s in syms)
                             )
 
-                        # час: спершу як у статті, інакше фолбек на Київ
+                        # ЧАС: якщо є «дисплей» із сайту (start_text) і є дата (start_dt),
+                        # показуємо їх разом. Інакше — пріоритет start_text, інакше — дата/час Київ.
                         start_text = a.get("start_text")
-                        if start_text:
+                        if start_text and start_dt:
+                            kyiv_dt = start_dt.astimezone(TZ) if start_dt.tzinfo else TZ.localize(start_dt)
+                            lines.append(f"🕒 Старт: {html_escape(start_text)} • {kyiv_dt.strftime('%Y-%m-%d')}")
+                        elif start_text:
                             lines.append(f"🕒 Старт: {html_escape(start_text)}")
                         else:
-                            lines.append(f"🕒 Старт (Київ): {_fmt_dt(a.get('start_dt'))}")
+                            lines.append(f"🕒 Старт (Київ): {_fmt_dt(start_dt)}")
 
                         lines.append(f"🔗 Джерело: {src_url}")
 

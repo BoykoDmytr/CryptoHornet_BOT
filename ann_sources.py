@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import os
 import re
-from typing import List, Dict, Any, Iterable, Optional
+import json
+from typing import List, Dict, Any, Iterable, Optional, Tuple
 from datetime import datetime
 from urllib.parse import urlencode, quote
 
@@ -31,7 +32,7 @@ HEADERS = {
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
     "Upgrade-Insecure-Requests": "1",
-    # “хромові” заголовки — часто вирішують саме 403 на MEXC/Gate
+    # “хромові” заголовки — часто допомагають на MEXC/Gate
     "Sec-Ch-Ua": '"Chromium";v="126", "Not.A/Brand";v="24", "Google Chrome";v="126"',
     "Sec-Ch-Ua-Mobile": "?0",
     "Sec-Fetch-Site": "none",
@@ -48,8 +49,8 @@ HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
 HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
 PROXIES = {"http": HTTP_PROXY, "https": HTTPS_PROXY} if (HTTP_PROXY or HTTPS_PROXY) else None
 
-# опційно — наприклад: https://api.scraperapi.com?api_key=KEY&url
-SCRAPER_URL = os.getenv("SCRAPER_URL", "").rstrip("/")
+# Приклад: "https://<your-worker>.workers.dev?url=" або "https://.../fetch?url=" або "https://.../proxy/"
+SCRAPER_URL = (os.getenv("SCRAPER_URL", "") or "").rstrip("/")
 
 # локальні/мовні кукі (інколи прибирають 403)
 try:
@@ -58,6 +59,25 @@ try:
     SESSION.cookies.set("lang", "en_US", domain=".gate.com")
 except Exception:
     pass
+
+
+def _wrap_scraper_target(q: str) -> str:
+    """
+    Гнучко формуємо URL до зовнішнього скрейпера:
+    - якщо SCRAPER_URL містить '{url}' -> підставляємо
+    - якщо закінчується '=' -> просто додаємо закодований q
+    - якщо вже є '?', але нема '=' в кінці -> додаємо '&url=' + q
+    - інакше -> '?url=' + q
+    """
+    if not SCRAPER_URL:
+        return q
+    if "{url}" in SCRAPER_URL:
+        return SCRAPER_URL.replace("{url}", quote(q, safe=""))
+    if SCRAPER_URL.endswith("="):
+        return SCRAPER_URL + quote(q, safe="")
+    if "?" in SCRAPER_URL:
+        return SCRAPER_URL + "&url=" + quote(q, safe="")
+    return SCRAPER_URL + "?url=" + quote(q, safe="")
 
 
 def _fetch(url: str, params: Dict[str, Any] | None = None):
@@ -80,7 +100,7 @@ def _fetch(url: str, params: Dict[str, Any] | None = None):
                         impersonate=imp,
                         timeout=25,
                         proxies=PROXIES,
-                        http2=True,  # важливо — багато сайтів очікують h2
+                        http2=True,
                     )
                     if r2.status_code == 200:
                         return r2
@@ -93,7 +113,7 @@ def _fetch(url: str, params: Dict[str, Any] | None = None):
             q = url
             if params:
                 q = url + ("&" if "?" in url else "?") + urlencode(params)
-            final = f"{SCRAPER_URL}={quote(q, safe='')}"
+            final = _wrap_scraper_target(q)
             r3 = SESSION.get(final, timeout=25, allow_redirects=True)
             r3.raise_for_status()
             return r3
@@ -103,6 +123,7 @@ def _fetch(url: str, params: Dict[str, Any] | None = None):
 
 def get_html(url: str, params: Dict[str, Any] | None = None) -> str:
     return _fetch(url, params=params).text
+
 
 # ---------- загальні утиліти --------------------------------------------------
 
@@ -132,7 +153,8 @@ MONTHS = {
     "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
 }
 
-RE_PAIR = re.compile(r"\b([A-Z0-9]{2,})\s*/\s*USDT\b|\b([A-Z0-9]{2,})USDT(?:-M)?\b")
+# ширший патерн пар: /, _, -, з/без суфікса -M
+RE_PAIR = re.compile(r"\b([A-Z0-9]{2,})\s*(?:/|_|-)?\s*USDT(?:-M)?\b")
 
 
 def uniq(seq: Iterable[str]) -> List[str]:
@@ -146,9 +168,9 @@ def uniq(seq: Iterable[str]) -> List[str]:
 
 def extract_symbols(text: str) -> List[str]:
     out = set()
-    up = text.upper()
+    up = (text or "").upper()
     for m in RE_PAIR.finditer(up):
-        sym = (m.group(1) or m.group(2) or "").strip()
+        sym = (m.group(1) or "").strip()
         if not sym:
             continue
         if sym.endswith("USDT"):
@@ -168,7 +190,7 @@ def _mk_dt(d: int, mon_name: str, y: int, h: int, m: int, tz_token: Optional[str
 
 
 def parse_dt_kiev(text: str) -> Optional[datetime]:
-    t = " ".join(text.split())
+    t = " ".join((text or "").split())
     m = RE_TIME_FIRST.search(t)
     if m:
         return _mk_dt(int(m["d"]), m["mon"], int(m["y"]), int(m["h"]), int(m["m"]), m.group("tz"))
@@ -177,10 +199,11 @@ def parse_dt_kiev(text: str) -> Optional[datetime]:
         return _mk_dt(int(m2["d"]), m2["mon"], int(m2["y"]), int(m2["h"]), int(m2["m"]), m2.group("tz"))
     return None
 
+
 # ----------- display-час як у статті + dt у Києві ----------------------------
 
 RE_TZ_LABEL = re.compile(
-    r"(?P<t>\d{1,2}:\d{2})\s*(?P<label>"
+    r"(?P<h>\d{1,2}):(?P<m>\d{2})\s*(?P<label>"
     r"UTC(?:[+\-]\d{1,2})?|GMT|MSK|MSD|HKT|SGT|KST|JST|CET|CEST|EET|EEST|PST|PDT|EST|EDT"
     r")\b",
     re.I,
@@ -188,29 +211,33 @@ RE_TZ_LABEL = re.compile(
 RE_KYIV_LABEL = re.compile(r"(?P<t>\d{1,2}:\d{2})\s*\((?:за|по)\s*києвом\)", re.I)
 
 
-def parse_dt_and_display(text: str) -> tuple[Optional[datetime], Optional[str]]:
+def parse_dt_and_display(text: str) -> Tuple[Optional[datetime], Optional[str]]:
     """
     Повертає:
       - dt_kiev: datetime у Europe/Kyiv (для БД/антидубля)
-      - display: як написано в статті (напр. '11:30 UTC' або '13:10 (за Києвом)')
+      - display: як у статті (напр. '11:30 UTC' чи '13:10 (за Києвом)'),
+        але лише якщо час валідний (0<=h<24, 0<=m<60)
     """
-    t = " ".join(text.split())
+    t = " ".join((text or "").split())
 
-    # 1) знайти готовий фрагмент з таймзоною (UTC, MSK, ...)
+    # 1) 'HH:MM <TZ>'
     m = RE_TZ_LABEL.search(t)
     if m:
-        disp = f"{m.group('t')} {m.group('label').upper()}"
-        dt = parse_dt_kiev(t)  # конвертує в Київ, якщо був UTC/GMT
-        return dt, disp
+        h = int(m.group("h"))
+        mm = int(m.group("m"))
+        if 0 <= h <= 23 and 0 <= mm <= 59:
+            disp = f"{h:02d}:{mm:02d} {m.group('label').upper()}"
+            dt = parse_dt_kiev(t)  # конвертує в Київ, якщо була дата + UTC/GMT
+            return dt, disp
 
-    # 2) '13:10 (за Києвом)'
+    # 2) 'HH:MM (за Києвом)'
     m2 = RE_KYIV_LABEL.search(t)
     if m2:
         disp = f"{m2.group('t')} (за Києвом)"
         dt = parse_dt_kiev(t)
         return dt, disp
 
-    # 3) універсально (як раніше)
+    # 3) універсально (якщо в тексті є і дата, і час)
     dt = parse_dt_kiev(t)
     if dt:
         if " utc" in t.lower():
@@ -221,36 +248,149 @@ def parse_dt_and_display(text: str) -> tuple[Optional[datetime], Optional[str]]:
 
     return None, None
 
+
+def _dt_from_iso(s: str) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        s2 = s.strip()
+        if s2.endswith("Z"):
+            s2 = s2[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s2)
+        if dt.tzinfo is None:
+            dt = pytz.utc.localize(dt)
+        return dt.astimezone(UA_TZ)
+    except Exception:
+        return None
+
+
+def extract_meta_dt(soup: BeautifulSoup) -> Optional[datetime]:
+    """Пробуємо витягнути дату публікації зі стандартних метаданих/ld+json."""
+    cands = []
+    for sel in [
+        ("meta", {"property": "article:published_time"}),
+        ("meta", {"property": "og:article:published_time"}),
+        ("meta", {"name": "pubdate"}),
+        ("meta", {"itemprop": "datePublished"}),
+        ("time", {"datetime": True}),
+    ]:
+        tag = soup.find(sel[0], attrs=sel[1])
+        if tag:
+            val = tag.get("content") or tag.get("datetime") or tag.get("value")
+            if val:
+                cands.append(val)
+
+    for js in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            data = json.loads(js.string or "")
+            def walk(x):
+                if isinstance(x, dict):
+                    v = x.get("datePublished") or x.get("dateModified")
+                    if isinstance(v, str):
+                        cands.append(v)
+                    for vv in x.values():
+                        walk(vv)
+                elif isinstance(x, list):
+                    for vv in x:
+                        walk(vv)
+            walk(data)
+        except Exception:
+            pass
+
+    for s in cands:
+        dt = _dt_from_iso(s)
+        if dt:
+            return dt
+    return None
+
+
 # ------ MEXC: лише FUTURES ----------------------------------------------------
 
 def mexc_futures_latest(locale: Optional[str] = None) -> List[Dict[str, Any]]:
-    # Часто uk-UA блочать; дозволимо задавати локаль через ENV.
-    locale = locale or os.getenv("MEXC_LOCALE", "en-US")
-    base = f"https://www.mexc.com/{locale}/announcements/new-listings/19"
-    soup = BeautifulSoup(get_html(base), "html.parser")
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/announcements/article" in href:
-            if not href.startswith("http"):
-                href = f"https://www.mexc.com/{locale}{href if href.startswith('/') else '/' + href}"
-            links.append(href)
-    links = uniq(links)[:20]
+    """
+    MEXC Futures: витягаємо посилання і з <a>, і з вбудованого window.__NUXT__ JSON.
+    Падаємо назад на різні локалі, поки не знайдемо хоч щось.
+    """
+    locales_try: List[str] = []
+    if locale or os.getenv("MEXC_LOCALE"):
+        locales_try.append(locale or os.getenv("MEXC_LOCALE"))
+    for loc in ("en-US", "ru-RU", "uk-UA"):
+        if loc not in locales_try:
+            locales_try.append(loc)
+
+    links: set[str] = set()
+
+    for loc in locales_try:
+        base = f"https://www.mexc.com/{loc}/announcements/new-listings/19"
+        html = get_html(base)
+
+        # А) пробуємо <a>
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if ("/announcements/article" in href) or ("/announcements/detail" in href):
+                if not href.startswith("http"):
+                    href = f"https://www.mexc.com/{loc}{href if href.startswith('/') else '/' + href}"
+                links.add(href)
+
+        # Б) window.__NUXT__
+        if len(links) < 5:
+            m = re.search(r"window\.__NUXT__\s*=\s*({.*?})\s*;</script>", html, re.S)
+            if m:
+                try:
+                    nuxt = json.loads(m.group(1))
+                except Exception:
+                    nuxt = None
+
+                ids: set[str] = set()
+
+                def walk(x):
+                    if isinstance(x, dict):
+                        if "articleId" in x:
+                            try:
+                                ids.add(str(x["articleId"]))
+                            except Exception:
+                                pass
+                        for v in x.values():
+                            walk(v)
+                    elif isinstance(x, list):
+                        for v in x:
+                            walk(v)
+
+                if nuxt:
+                    walk(nuxt)
+                    for aid in ids:
+                        links.add(f"https://www.mexc.com/{loc}/announcements/article/{aid}")
+
+            # В) ще regex «articleId»
+            if len(links) < 5:
+                for aid in re.findall(r'"articleId"\s*:\s*"?(\d+)"?', html):
+                    links.add(f"https://www.mexc.com/{loc}/announcements/article/{aid}")
+
+        if links:
+            break
+
+    if not links:
+        return []
+
     out: List[Dict[str, Any]] = []
-    for u in links:
+    for u in list(links)[:30]:
         s = BeautifulSoup(get_html(u), "html.parser")
         title = s.find("h1").get_text(" ", strip=True) if s.find("h1") else ""
         plain = s.get_text(" ", strip=True)
         syms = extract_symbols(plain)
         dt, disp = parse_dt_and_display(plain)
+        if dt is None:
+            dt = extract_meta_dt(s)  # хоч дата публікації
         out.append({"exchange": "mexc", "market": "futures", "title": title, "symbols": syms,
                     "start_dt": dt, "start_text": disp, "url": u})
     return out
 
+
 # ------ GATE: spot / futures (fallback-и .io/.com і ru/en) --------------------
 
 def gate_collect(market: str) -> List[Dict[str, Any]]:
-    # Спробуємо кілька сторінок — що перша віддасть 200, ту й парсимо
+    # Спробуємо кілька сторінок — першу, що віддасть 200, парсимо
     candidates = [
         ("https://www.gate.io/ru/announcements/newspotlistings", "https://www.gate.io") if market == "spot"
         else ("https://www.gate.io/ru/announcements/newfutureslistings", "https://www.gate.io"),
@@ -273,7 +413,7 @@ def gate_collect(market: str) -> List[Dict[str, Any]]:
                 continue
             raise
     if html is None:
-        raise requests.HTTPError("403/blocked on all Gate endpoints")  # підхопить верхній try/except
+        raise requests.HTTPError("403/blocked on all Gate endpoints")  # підхопиться верхнім try/except
 
     soup = BeautifulSoup(html, "html.parser")
     arts = []
@@ -284,6 +424,7 @@ def gate_collect(market: str) -> List[Dict[str, Any]]:
                 href = base_domain + href
             arts.append(href)
     arts = uniq(arts)[:20]
+
     out = []
     for u in arts:
         s = BeautifulSoup(get_html(u), "html.parser")
@@ -291,6 +432,8 @@ def gate_collect(market: str) -> List[Dict[str, Any]]:
         plain = s.get_text(" ", strip=True)
         syms = extract_symbols(plain)
         dt, disp = parse_dt_and_display(plain)
+        if dt is None:
+            dt = extract_meta_dt(s)
         out.append({"exchange": "gate", "market": market, "title": title, "symbols": syms,
                     "start_dt": dt, "start_text": disp, "url": u})
     return out
@@ -303,7 +446,8 @@ def gate_spot_latest() -> List[Dict[str, Any]]:
 def gate_futures_latest() -> List[Dict[str, Any]]:
     return gate_collect("futures")
 
-# ------ BINGX: spot / futures --------------------------------------------------
+
+# ------ BINGX: spot / futures -------------------------------------------------
 
 def bingx_collect(section_url: str, market: str) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(get_html(section_url), "html.parser")
@@ -322,6 +466,8 @@ def bingx_collect(section_url: str, market: str) -> List[Dict[str, Any]]:
         plain = s.get_text(" ", strip=True)
         syms = extract_symbols(plain)
         dt, disp = parse_dt_and_display(plain)
+        if dt is None:
+            dt = extract_meta_dt(s)
         out.append({"exchange": "bingx", "market": market, "title": title, "symbols": syms,
                     "start_dt": dt, "start_text": disp, "url": u})
     return out
@@ -333,6 +479,7 @@ def bingx_spot_latest() -> List[Dict[str, Any]]:
 
 def bingx_futures_latest() -> List[Dict[str, Any]]:
     return bingx_collect("https://bingx.com/en/support/notice-center/11257015822991", "futures")
+
 
 # ------ BITGET: spot / futures (EN) -------------------------------------------
 
@@ -353,6 +500,8 @@ def bitget_collect(section_url: str, market: str) -> List[Dict[str, Any]]:
         plain = s.get_text(" ", strip=True)
         syms = extract_symbols(plain)
         dt, disp = parse_dt_and_display(plain)
+        if dt is None:
+            dt = extract_meta_dt(s)
         out.append({"exchange": "bitget", "market": market, "title": title, "symbols": syms,
                     "start_dt": dt, "start_text": disp, "url": u})
     return out
@@ -364,6 +513,7 @@ def bitget_spot_latest() -> List[Dict[str, Any]]:
 
 def bitget_futures_latest() -> List[Dict[str, Any]]:
     return bitget_collect("https://www.bitget.com/en/support/sections/12508313405000", "futures")
+
 
 # ------ OKX: spot + futures (тільки заголовки, що починаються з "Лістинг/Listing") --
 
@@ -395,9 +545,12 @@ def okx_latest() -> List[Dict[str, Any]]:
         syms = extract_symbols(plain)
         market = "futures" if any(k in plain.lower() for k in ["swap", "perpetual", "ф'ючер", "фьючер"]) else "spot"
         dt, disp = parse_dt_and_display(plain)
+        if dt is None:
+            dt = extract_meta_dt(s)
         out.append({"exchange": "okx", "market": market, "title": title, "symbols": syms,
                     "start_dt": dt, "start_text": disp, "url": u})
     return out
+
 
 # ------ BINANCE: spot + futures + alpha (CMS API) -----------------------------
 
@@ -421,6 +574,8 @@ def binance_latest(rows: int = 20) -> List[Dict[str, Any]]:
                 plain = s.get_text(" ", strip=True)
                 syms = extract_symbols(plain)
                 dt, disp = parse_dt_and_display(plain)
+                if dt is None:
+                    dt = extract_meta_dt(s)
                 market = "spot"
                 t = (title or "").lower()
                 if "futures" in t or "perpetual" in plain.lower():
@@ -433,7 +588,8 @@ def binance_latest(rows: int = 20) -> List[Dict[str, Any]]:
             continue
     return out
 
-# ------ реєстр джерел (з можливістю вимкнути через ENV) ----------------------
+
+# ------ реєстр джерел (можна вимкнути через ENV=DISABLE_SOURCES) --------------
 
 def sources_matrix() -> List:
     disabled = {s.strip().lower() for s in os.getenv("DISABLE_SOURCES", "").split(",") if s.strip()}
