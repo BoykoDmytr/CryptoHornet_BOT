@@ -198,19 +198,29 @@ def _gate_futures() -> Dict[str, str]:
 # --------------------------------------
 # BITGET
 # --------------------------------------
-def _bitget_spot() -> Dict[str, str]:
-    # https://api.bitget.com/api/spot/v1/public/symbols
-    j = _get_json("https://api.bitget.com/api/spot/v1/public/symbols")
-    out: Dict[str, str] = {}
-    for it in j.get("data", []):
-        sym = it.get("symbol")  # e.g. BTCUSDT
-        if not sym or "USDT" not in sym:
+# --- BITGET SPOT (fixed endpoint) ---
+def bitget_spot_symbols(only_usdt: bool = True) -> list[str]:
+    """
+    Bitget spot products: GET /api/spot/v1/public/products
+    doc: https://api.bitget.com ... (official docs list this endpoint)
+    """
+    url = "https://api.bitget.com/api/spot/v1/public/products"
+    r = _fetch(url)
+    j = r.json()
+    items = j.get("data") or []
+    out = []
+    for it in items:
+        # fields: baseCoin, quoteCoin, symbol, status ...
+        sym = (it.get("symbol") or "").upper()  # e.g. BTCUSDT
+        if not sym:
             continue
-        base, quote = sym[:-4], "USDT"
-        pair = f"{base}/{quote}"
-        url  = f"https://www.bitget.com/spot/{base}{quote}"
-        out[pair] = url
-    return out
+        if only_usdt:
+            # accept USDT quotes only
+            q = (it.get("quoteCoin") or "").upper()
+            if q != "USDT":
+                continue
+        out.append(sym)
+    return sorted(set(out))
 
 def _bitget_futures() -> Dict[str, str]:
     # USDT-M perpetuals (productType=umcbl)
@@ -230,20 +240,27 @@ def _bitget_futures() -> Dict[str, str]:
 # --------------------------------------
 # MEXC
 # --------------------------------------
-def _mexc_spot() -> Dict[str, str]:
-    # https://api.mexc.com/api/v3/exchangeInfo (аналог binance)
-    j = _get_json("https://api.mexc.com/api/v3/exchangeInfo")
-    out: Dict[str, str] = {}
-    for s in j.get("symbols", []):
-        if s.get("status") != "TRADING":
-            continue
-        base, quote = s.get("baseAsset"), s.get("quoteAsset")
+# --- MEXC SPOT (fixed) ---
+def mexc_spot_symbols(only_usdt: bool = True) -> list[str]:
+    """
+    MEXC spot exchange info: GET /api/v3/exchangeInfo
+    """
+    url = "https://api.mexc.com/api/v3/exchangeInfo"
+    j = _fetch(url).json()
+    syms = j.get("symbols") or []
+    out = []
+    for it in syms:
+        base = (it.get("baseAsset") or "").upper()
+        quote = (it.get("quoteAsset") or "").upper()
+        status = (it.get("status") or "").upper()
         if not base or not quote:
             continue
-        pair = f"{base}/{quote}"
-        url  = f"https://www.mexc.com/exchange/{base}_{quote}"
-        out[pair] = url
-    return out
+        if status not in ("TRADING", "PENDING_TRADING", "PRE_TRADING"):
+            continue
+        if only_usdt and quote != "USDT":
+            continue
+        out.append(f"{base}{quote}")
+    return sorted(set(out))
 
 def _mexc_futures() -> Dict[str, str]:
     # Список контрактів USDT-M (перпетуали).
@@ -295,39 +312,45 @@ def _bingx_headers() -> dict:
     api_key = os.getenv("BINGX_API_KEY", "").strip()
     return {"X-BX-APIKEY": api_key} if api_key else {}
 
-def _bingx_spot() -> Dict[str, str]:
-    # https://open-api.bingx.com/openApi/spot/v1/common/symbols
-    j = _get_json("https://open-api.bingx.com/openApi/spot/v1/common/symbols", headers=_bingx_headers())
-    out: Dict[str, str] = {}
-    data = j.get("data") or j.get("result") or []
+# --- BINGX SPOT (fixed) ---
+def bingx_spot_symbols(only_usdt: bool = True) -> list[str]:
+    """
+    BingX spot symbols: GET /openApi/spot/v1/common/symbols
+    Returns list with fields like: symbol, baseAsset, quoteAsset, status...
+    """
+    url = "https://open-api.bingx.com/openApi/spot/v1/common/symbols"
+    j = _fetch(url).json()
+    data = j.get("data") or []
+    out = []
     for it in data:
-        base = it.get("baseAsset") or it.get("baseCurrency")
-        quote = it.get("quoteAsset") or it.get("quoteCurrency")
+        base = (it.get("baseAsset") or "").upper()
+        quote = (it.get("quoteAsset") or "").upper()
         if not base or not quote:
             continue
-        pair = f"{base}/{quote}"
-        url  = f"https://bingx.com/spot/{base}{quote}"
-        out[pair] = url
-    return out
-
-def _bingx_futures() -> Dict[str, str]:
-    # https://open-api.bingx.com/openApi/swap/v2/common/symbols
-    j = _get_json("https://open-api.bingx.com/openApi/swap/v2/common/symbols", headers=_bingx_headers())
-    out: Dict[str, str] = {}
-    data = j.get("data") or j.get("result") or []
-    for it in data:
-        sym = it.get("symbol")  # BTC-USDT
-        if not sym:
+        if only_usdt and quote != "USDT":
             continue
-        if "-" in sym:
-            base, quote = sym.split("-")[0], sym.split("-")[1]
-        else:
-            base = sym.replace("USDT", "")
-            quote = "USDT"
-        pair = f"{base}/{quote}"
-        url  = f"https://bingx.com/futures/{base}{quote}"
-        out[pair] = url
-    return out
+        out.append(f"{base}{quote}")
+    return sorted(set(out))
+
+# --- BINGX FUTURES (fixed) ---
+def bingx_futures_symbols(only_usdt: bool = True) -> list[str]:
+    """
+    BingX futures contracts: GET /openApi/swap/v2/quote/contracts
+    Contract symbol often like 'BTC-USDT' -> normalize to BTCUSDT
+    """
+    url = "https://open-api.bingx.com/openApi/swap/v2/quote/contracts"
+    j = _fetch(url).json()
+    data = (j.get("data") or {}).get("contracts") or j.get("data") or []
+    out = []
+    for it in data:
+        s = (it.get("symbol") or it.get("contractName") or "").upper()  # e.g. BTC-USDT
+        if not s:
+            continue
+        s = s.replace("-", "")
+        if only_usdt and not s.endswith("USDT"):
+            continue
+        out.append(s)
+    return sorted(set(out))
 
 # --------------------------------------
 # BYBIT
