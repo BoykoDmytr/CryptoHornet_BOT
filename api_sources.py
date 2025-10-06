@@ -7,10 +7,24 @@ import json
 import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional
+import datetime as _dt
+import pytz as _pytz
 
 import requests
 
 log = logging.getLogger("hornet.api")
+
+EXCHANGE_TZ = {
+    "binance": _pytz.utc,                      # Binance оголошення в UTC
+    "okx": _pytz.utc,                          # OKX також публікує в UTC
+    "gate": _pytz.timezone("Asia/Shanghai"),   # Gate часто використовує UTC+8 (Шанхай)
+    "bitget": _pytz.timezone("Asia/Singapore"),# Bitget здебільшого UTC+8 у матеріалах
+    "mexc": _pytz.timezone("Asia/Singapore"),  # MEXC зазвичай UTC+8
+    "bingx": _pytz.timezone("Asia/Singapore"), # BingX UTC+8
+    "bybit": _pytz.timezone("Asia/Singapore"), # Bybit UTC+8
+    "bithumb": _pytz.timezone("Asia/Seoul"),   # Bithumb KST
+    "upbit": _pytz.timezone("Asia/Seoul"),     # Upbit KST
+}
 
 # -------------------------------------------------------
 # HTTP session (стабільні заголовки + необов'язковий проксі)
@@ -62,6 +76,14 @@ def _now_utc_text() -> str:
 #
 # api_preview(exchange, market, limit=5) -> List[event dict]
 #   повертає "фейкові нові" події для швидкого тесту бота (без очікувань)
+
+def api_now_exchange_iso(exchange: str) -> str:
+    """
+    Повертає поточний час у таймзоні біржі у форматі 'YYYY-MM-DD HH:MM TZ'.
+    Використовується лише для виводу/логів.
+    """
+    tz = EXCHANGE_TZ.get((exchange or "").lower(), _pytz.utc)
+    return _dt.datetime.now(tz).strftime("%Y-%m-%d %H:%M %Z")
 
 SUPPORTED: Dict[str, Tuple[bool, bool]] = {
     # exchange: (has_spot, has_futures)

@@ -27,7 +27,7 @@ from api_sources import (
     api_seed_all,             # () -> Dict[(ex, mk) -> Dict[pair->url, ...]]
     api_fetch_snapshot,       # (ex, mk) -> Dict[pair->url, ...]
     api_build_events_from_diff,  # (ex, mk, prev, cur) -> List[Dict(event...)]
-    api_now_exchange_iso,     # (ex, mk) -> str | None  (час з біржі у вигляді ISO або людейно)
+    #api_now_exchange_iso,     # (ex, mk) -> str | None  (час з біржі у вигляді ISO або людейно)
 )
 
 # ----------------------- LOGGING -----------------------
