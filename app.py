@@ -171,6 +171,63 @@ def _upsert_seen_pair(exchange: str, market: str, pair: str, url: Optional[str])
         return True  # на всяк випадок не блокуємо постинг
 
 # -------------------- BOT (команди) -------------------
+# --- TEST: /inject <exchange> <spot|futures> <BASE/QUOTE> [start] [end] [channel]
+async def cmd_inject(update, context):
+    args = (context.args or [])
+    if len(args) < 3:
+        return await update.message.reply_text(
+            "usage:\n"
+            "/inject <exchange> <spot|futures> <BASE/QUOTE> [start_text] [end_text] [channel]\n"
+            "example:\n"
+            "/inject gate spot BTC/USDT \"2025-10-07 13:00 UTC+8\" \"2025-10-07 15:00 UTC+8\" channel"
+        )
+    ex = args[0].lower()
+    mk = args[1].lower()
+    pair = args[2].upper()
+    start_text = args[3] if len(args) >= 4 else ""
+    end_text   = args[4] if len(args) >= 5 else ""
+    to_channel = (len(args) >= 6 and args[5].lower() == "channel")
+
+    base, quote = (pair.split("/", 1) + [""])[:2]
+    ev = {
+        "exchange": ex,
+        "market": mk,
+        "pair": pair,
+        "base": base,
+        "quote": quote,
+        "url": "",
+        "title": "тестова пара (API inject)",
+        "start_text": start_text,
+        "end_text": end_text,
+        "start_dt": None,
+    }
+
+    # той самий рендер, що і для реальних API-івентів
+    lines = []
+    title_line = f"✅ <b>{ex.upper()}</b> — {mk} нова пара (API)"
+    lines.append(title_line)
+    lines.append(f"Пара: <code>{pair}</code>")
+
+    t_lines = []
+    if start_text and end_text:
+        t_lines.append(f"🕒 {start_text} → {end_text}")
+    elif start_text:
+        t_lines.append(f"🕒 {start_text}")
+    if t_lines:
+        lines.extend(t_lines)
+
+    text = "\n".join(lines)
+    if to_channel:
+        send_bot_message(text, disable_preview=False)
+        await update.message.reply_text("✅ injected to channel")
+    else:
+        await update.message.reply_html(text, disable_web_page_preview=False)
+
+# реєстрація
+app.add_handler(CommandHandler("inject", cmd_inject))
+
+
+
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
 
