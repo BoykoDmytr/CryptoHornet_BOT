@@ -482,7 +482,7 @@ def api_fetch_snapshot(exchange: str, market: str) -> Dict[str, str]:
         if ex == "bitget":
             return _bitget_spot() if mk == "spot" else _bitget_futures()
         if ex == "mexc":
-            return _mexc_futures()
+            return _mexc_spot() if mk == "spot" else _mexc_futures()
         if ex == "bingx":
             return _bingx_spot() if mk == "spot" else _bingx_futures()
         if ex == "bybit":
