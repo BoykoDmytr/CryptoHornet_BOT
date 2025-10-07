@@ -4,30 +4,25 @@ from __future__ import annotations
 import os
 import sys
 import time
+import json
 import random
-import yaml
-import pytz
 import asyncio
-import sqlite3
 import logging
-import requests
-from typing import List, Optional, Tuple, Dict
-from datetime import datetime
+from html import escape as html_escape
+from typing import Dict, List, Tuple, Optional
 
 from dotenv import load_dotenv
 
-# Telegram
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram.error import Conflict
+from telegram.constants import ParseMode
 
-# ---- наші джерела через API бірж (окремий модуль) ----
+# --- API-шари (жодного HTML-парсингу) ---
 from api_sources import (
-    ALL_EXCHANGES,            # List[Tuple[str, str]]: [("binance","spot"), ("gate","futures"), ...]
-    api_seed_all,             # () -> Dict[(ex, mk) -> Dict[pair->url, ...]]
-    api_fetch_snapshot,       # (ex, mk) -> Dict[pair->url, ...]
-    api_build_events_from_diff,  # (ex, mk, prev, cur) -> List[Dict(event...)]
-    api_now_exchange_iso,     # (ex, mk) -> str | None  (час з біржі у вигляді ISO або людейно)
+    api_fetch_snapshot,
+    api_build_events_from_diff,
+    api_preview,
+    ALL_EXCHANGES,
 )
 
 # ----------------------- LOGGING -----------------------
@@ -41,83 +36,138 @@ log = logging.getLogger("hornet")
 # ----------------------- ENV --------------------------
 load_dotenv()
 
-BOT_TOKEN       = os.getenv("BOT_TOKEN", "")
-TARGET_CHAT_ID  = os.getenv("TARGET_CHAT_ID", "")
-OWNER_CHAT_ID   = os.getenv("OWNER_CHAT_ID", "")
+BOT_TOKEN        = os.getenv("BOT_TOKEN", "")
+TARGET_CHAT_ID   = os.getenv("TARGET_CHAT_ID", "")
+OWNER_CHAT_ID    = os.getenv("OWNER_CHAT_ID", "")
 
-# Таймзона залишається для сумісності (може знадобитися в майбутньому)
-TIMEZONE        = os.getenv("TIMEZONE", "Europe/Kyiv")
-TZ              = pytz.timezone(TIMEZONE)
+ENABLE_POLLING   = os.getenv("ENABLE_POLLING", "1").strip() == "1"
+API_PAIRS_INTERVAL_SEC = int(os.getenv("API_PAIRS_INTERVAL_SEC", "300"))
 
-# Інтервал опитування API (сек)
-API_POLL_SEC    = int(os.getenv("API_POLL_SEC", "180"))
+# Список вимкнених джерел моніторингу у форматі: "mexc/spot, bingx/spot"
+DISABLE_API = {
+    p.strip().lower()
+    for p in os.getenv("DISABLE_API", "mexc/spot").split(",")
+    if p.strip()
+}
 
-# Скільки сек чекати між sendMessage (щоб не ловити 429)
-MIN_GAP_BETWEEN_MESSAGES = float(os.getenv("TG_MIN_GAP_SEC", "1.2"))
+STATE_PATH = os.getenv("DB_PATH", "state.json")  # JSON-файл зі станом (seen + snapshots)
 
-# ----------------------- DB ---------------------------
-DB_PATH = os.getenv("DB_PATH", "state.db")  # на хостингу краще /data/state.db
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-cur  = conn.cursor()
+# --------------------- STATE (JSON) --------------------
+# Структура:
+# {
+#   "seen": {
+#       "<dedupe_key>": 1730792100,  # unixtime
+#       ...
+#   },
+#   "snapshots": {
+#       "binance/spot": {"BTC/USDT": "https://...", ...},
+#       "gate/futures": {"ETH/USDT": "https://...", ...},
+#       ...
+#   }
+# }
 
-# Таблиця для старої логіки оголошень (залишаємо, раптом повернешся до HTML)
-cur.execute("""
-CREATE TABLE IF NOT EXISTS seen_announcements(
-  url TEXT PRIMARY KEY,
-  exchange TEXT,
-  market TEXT,
-  title TEXT,
-  symbols TEXT,
-  start_ts INTEGER
-)""")
+_state_cache: Dict[str, dict] | None = None
 
-# Нова таблиця: щоб не дублювати API події між рестартами
-cur.execute("""
-CREATE TABLE IF NOT EXISTS seen_pairs(
-  exchange TEXT NOT NULL,
-  market   TEXT NOT NULL,
-  pair     TEXT NOT NULL,
-  url      TEXT,
-  first_seen_ts INTEGER,
-  PRIMARY KEY(exchange, market, pair)
-)""")
-conn.commit()
+def _state_load() -> Dict[str, dict]:
+    global _state_cache
+    if _state_cache is not None:
+        return _state_cache
+    if not os.path.exists(STATE_PATH):
+        _state_cache = {"seen": {}, "snapshots": {}}
+        return _state_cache
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            _state_cache = json.load(f)
+            if not isinstance(_state_cache, dict):
+                _state_cache = {"seen": {}, "snapshots": {}}
+    except Exception:
+        _state_cache = {"seen": {}, "snapshots": {}}
+    # захист від поламаних структур
+    _state_cache.setdefault("seen", {})
+    _state_cache.setdefault("snapshots", {})
+    return _state_cache
 
-# ----------------------- UTILS ------------------------
+def _state_save():
+    st = _state_load()
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STATE_PATH)
+
+def db_mark_new(dedupe_key: str) -> bool:
+    """
+    Повертає True, якщо ключ бачимо вперше (тобто можна постити).
+    Dedupe-ключ повинен стабільно ідентифікувати подію (наприклад: api://binance/futures/BTC/USDT).
+    """
+    st = _state_load()
+    seen = st["seen"]
+    if dedupe_key in seen:
+        return False
+    seen[dedupe_key] = int(time.time())
+    _state_save()
+    return True
+
+def get_prev_snapshot_key(ex: str, mk: str) -> str:
+    return f"{ex.lower().strip()}/{mk.lower().strip()}"
+
+def get_prev_snapshot(ex: str, mk: str) -> Dict[str, str]:
+    st = _state_load()
+    return dict(st["snapshots"].get(get_prev_snapshot_key(ex, mk), {}))
+
+def set_prev_snapshot(ex: str, mk: str, snapshot: Dict[str, str]):
+    st = _state_load()
+    st["snapshots"][get_prev_snapshot_key(ex, mk)] = snapshot or {}
+    _state_save()
+
+# ----------------------- TELEGRAM ----------------------
 _last_send_ts = 0.0
 
-def _html(msg: str) -> str:
-    """Проста екрануюча функція для HTML parse_mode."""
-    import html
-    return html.escape(msg, quote=False)
+def send_owner(text: str):
+    if not BOT_TOKEN or not OWNER_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": OWNER_CHAT_ID, "text": text},
+            timeout=15
+        )
+    except Exception:
+        pass
 
-def _send_telegram(chat_id: str, text: str, parse_mode: str = "HTML",
-                   disable_preview: bool = True, max_retries: int = 3):
+def send_bot_message(text_html: str, chat_id: Optional[str] = None, disable_preview: bool = True, max_retries: int = 3):
     """
-    Безпечна відправка:
-    - HTML parse_mode (щоб не ламався Markdown),
+    Надійна відправка в канал/чат:
+    - HTML розмітка (використовуй html_escape для всього динамічного),
+    - тротлінг між повідомленнями,
     - повага до 429 retry_after,
-    - глобальний тротлінг між повідомленнями.
+    - до 3 спроб.
     """
-    global _last_send_ts
+    import requests  # локальний імпорт, щоб не тягнути завжди
 
-    if not BOT_TOKEN or not chat_id:
-        log.warning("BOT_TOKEN або chat_id порожні — пропускаю send.")
+    global _last_send_ts
+    if not BOT_TOKEN:
+        log.warning("BOT_TOKEN порожній — пропускаю send.")
+        return
+
+    cid = chat_id or TARGET_CHAT_ID
+    if not cid:
+        log.warning("TARGET_CHAT_ID не заданий — пропускаю send.")
         return
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": parse_mode,
+        "chat_id": cid,
+        "text": text_html,
+        "parse_mode": "HTML",
         "disable_web_page_preview": disable_preview,
     }
 
-    # пер-чат ліміт
+    # простий throttle ~1.2s
     now = time.time()
     gap = now - _last_send_ts
-    if gap < MIN_GAP_BETWEEN_MESSAGES:
-        time.sleep(MIN_GAP_BETWEEN_MESSAGES - gap)
+    min_gap = 1.2
+    if gap < min_gap:
+        time.sleep(min_gap - gap)
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -126,6 +176,7 @@ def _send_telegram(chat_id: str, text: str, parse_mode: str = "HTML",
                 _last_send_ts = time.time()
                 return
             if r.status_code == 429:
+                # поважаємо retry_after
                 try:
                     j = r.json()
                     wait = int(j.get("parameters", {}).get("retry_after", 3))
@@ -135,292 +186,265 @@ def _send_telegram(chat_id: str, text: str, parse_mode: str = "HTML",
                 log.error("Bot send 429. Waiting %ss (attempt %d/%d)", wait, attempt, max_retries)
                 time.sleep(wait)
                 continue
+            # інші коди — лог і вихід
             log.error("Bot send error: %s %s", r.status_code, r.text[:500])
             return
         except Exception as e:
             log.exception("Bot send failed (attempt %d/%d): %s", attempt, max_retries, e)
             time.sleep(1 + attempt * 0.5 + random.random())
 
-def send_bot_message(text_html: str, disable_preview: bool = True):
-    if TARGET_CHAT_ID:
-        _send_telegram(TARGET_CHAT_ID, text_html, "HTML", disable_preview)
-
-def send_owner(text: str):
-    if OWNER_CHAT_ID:
-        _send_telegram(OWNER_CHAT_ID, _html(text), "HTML", True)
-
-def _fmt_pair_line(pair: str) -> str:
-    return f"<code>{_html(pair)}</code>"
-
-def _upsert_seen_pair(exchange: str, market: str, pair: str, url: Optional[str]) -> bool:
+# ----------------------- HELPERS ----------------------
+def format_event_html(ev: dict) -> str:
     """
-    Повертає True, якщо запис новий (тобто треба постити).
-    Якщо вже бачили — повертає False.
+    Єдиний формат для всіх бірж (API).
+    ev очікується з api_build_events_from_diff / api_preview:
+      - exchange, market, pair, base, quote, url, title
+      - start_text (за наявності; для API зазвичай 'detected: ...')
+      - start_dt (може бути None)
     """
-    ts = int(time.time())
-    try:
-        cur.execute(
-            "INSERT OR IGNORE INTO seen_pairs(exchange, market, pair, url, first_seen_ts) VALUES (?,?,?,?,?)",
-            (exchange, market, pair, url or None, ts),
-        )
-        conn.commit()
-        cur.execute("SELECT changes()")
-        return cur.fetchone()[0] > 0
-    except Exception as e:
-        log.exception("seen_pairs insert error: %s", e)
-        return True  # на всяк випадок не блокуємо постинг
+    ex = html_escape((ev.get("exchange") or "").upper())
+    mk = html_escape(ev.get("market") or "")
+    title = html_escape(ev.get("title") or "нова пара (API)")
+    pair = html_escape(ev.get("pair") or "")
+    url  = html_escape(ev.get("url") or "")
+
+    # текст часу: якщо api вміє — відобразимо, інакше показуємо detected
+    start_txt = ev.get("start_text")
+    if start_txt:
+        start_txt = html_escape(start_txt)
+
+    lines = [
+        f"✅ <b>{ex}</b> — <b>{mk}</b> {title}",
+        f"Пара: <code>{pair}</code>",
+        f"🔗 Тікер: {url}",
+    ]
+    # час — окремим рядком, якщо є
+    if start_txt:
+        lines.insert(2, f"🕒 Час: {start_txt}")
+
+    return "\n".join(lines)
+
+def monitored_pairs() -> List[Tuple[str, str]]:
+    """
+    Вибірка пар (exchange/market) для моніторингу з урахуванням DISABLE_API.
+    За замовчуванням у DISABLE_API вже є 'mexc/spot'.
+    """
+    all_pairs: List[Tuple[str, str]] = list(ALL_EXCHANGES)
+    out: List[Tuple[str, str]] = []
+    for ex, mk in all_pairs:
+        key = f"{ex}/{mk}".lower()
+        if key in DISABLE_API:
+            continue
+        out.append((ex, mk))
+    return out
 
 # -------------------- BOT (команди) -------------------
-# --- TEST: /inject <exchange> <spot|futures> <BASE/QUOTE> [start] [end] [channel]
-async def cmd_inject(update, context):
-    args = (context.args or [])
-    if len(args) < 3:
-        return await update.message.reply_text(
-            "usage:\n"
-            "/inject <exchange> <spot|futures> <BASE/QUOTE> [start_text] [end_text] [channel]\n"
-            "example:\n"
-            "/inject gate spot BTC/USDT \"2025-10-07 13:00 UTC+8\" \"2025-10-07 15:00 UTC+8\" channel"
-        )
-    ex = args[0].lower()
-    mk = args[1].lower()
-    pair = args[2].upper()
-    start_text = args[3] if len(args) >= 4 else ""
-    end_text   = args[4] if len(args) >= 5 else ""
-    to_channel = (len(args) >= 6 and args[5].lower() == "channel")
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong")
 
-    base, quote = (pair.split("/", 1) + [""])[:2]
+async def cmd_testpost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # простий тест у канал
+    msg = "✅ Test publish from Crypto Hornet bot."
+    send_bot_message(html_escape(msg))
+    await update.message.reply_text("Відправив тест у TARGET_CHAT_ID.")
+
+def _parse_preview_args(args: List[str]) -> Tuple[str, str, int, bool]:
+    """
+    /preview <exchange|all> <limit:int> [channel]
+    Приклади:
+      /preview all 2
+      /preview gate 3 channel
+      /preview binance 5
+    """
+    ex = (args[0] if args else "all").lower()
+    limit = 3
+    to_channel = False
+
+    market = "spot"  # для preview ми беремо і spot, і futures по черзі (див. нижче)
+
+    if len(args) >= 2 and args[1].isdigit():
+        limit = max(1, int(args[1]))
+
+    if len(args) >= 3 and args[2].lower() in ("chan", "channel", "c"):
+        to_channel = True
+
+    return ex, market, limit, to_channel
+
+async def cmd_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Швидкий прев’ю постів без очікувань реальних лістингів.
+    Забирає перші N із кожної вибраної (exchange,market) як "ніби нові".
+    """
+    if not update.message:
+        return
+    ex, market, limit, to_channel = _parse_preview_args(context.args or [])
+
+    pairs = monitored_pairs()
+    if ex != "all":
+        pairs = [(e, m) for (e, m) in pairs if e == ex]
+
+    if not pairs:
+        await update.message.reply_text("Немає джерел для прев’ю (можливо, все вимкнено через DISABLE_API).")
+        return
+
+    total = 0
+    for e, m in pairs:
+        # Для прев’ю: візьмемо spot і futures якщо є обидва й не фільтрували
+        if ex != "all":
+            targets = [(e, m)]
+        else:
+            # «all» — пройдемось по самих (e,m), що у monitored_pairs()
+            targets = [(e, m)]
+
+        for te, tm in targets:
+            events = api_preview(te, tm, limit=limit)
+            if not events:
+                txt = f"ℹ️ {te}/{tm}: порожньо."
+                if to_channel:
+                    send_bot_message(html_escape(txt))
+                else:
+                    await update.message.reply_text(txt)
+                continue
+
+            for ev in events:
+                html = format_event_html(ev)
+                if to_channel:
+                    send_bot_message(html)
+                else:
+                    await update.message.reply_html(html)
+                await asyncio.sleep(0.4)  # невеликий тротлінг
+                total += 1
+
+    if not to_channel:
+        await update.message.reply_text(f"✅ Готово. Відправлено {total} прев’ю.")
+
+def _owner_only(update: Update) -> bool:
+    try:
+        uid = update.effective_user.id if update.effective_user else None
+        return OWNER_CHAT_ID and str(uid) == str(OWNER_CHAT_ID)
+    except Exception:
+        return False
+
+async def cmd_inject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Ручна ін’єкція події (для тестів), тільки для OWNER.
+    Формат:
+      /inject <exchange> <spot|futures> <BASE/QUOTE> <url?>
+    Приклад:
+      /inject gate futures LYN/USDT https://www.gate.io/futures_trade/USDT/LYN_USDT
+    """
+    if not _owner_only(update):
+        await update.message.reply_text("Доступно лише власнику.")
+        return
+
+    args = context.args or []
+    if len(args) < 3:
+        await update.message.reply_text("Формат: /inject <exchange> <spot|futures> <BASE/QUOTE> <url?>")
+        return
+
+    ex, mk, pair = args[0].lower(), args[1].lower(), args[2].upper()
+    url = args[3] if len(args) >= 4 else f"https://example.com/{ex}/{mk}/{pair.replace('/', '')}"
+
     ev = {
         "exchange": ex,
         "market": mk,
         "pair": pair,
-        "base": base,
-        "quote": quote,
-        "url": "",
-        "title": "тестова пара (API inject)",
-        "start_text": start_text,
-        "end_text": end_text,
+        "base": pair.split("/", 1)[0],
+        "quote": pair.split("/", 1)[1] if "/" in pair else "",
+        "url": url,
+        "title": "тестова пара (INJECT)",
+        # показуємо чітко, що це штучний івент
+        "start_text": "manual inject",
         "start_dt": None,
     }
+    dedupe = f"api://{ex}/{mk}/{pair}"
+    if not db_mark_new(dedupe):
+        await update.message.reply_text("Вже ін’єктовано раніше (дедуп).")
+        return
 
-    # той самий рендер, що і для реальних API-івентів
-    lines = []
-    title_line = f"✅ <b>{ex.upper()}</b> — {mk} нова пара (API)"
-    lines.append(title_line)
-    lines.append(f"Пара: <code>{pair}</code>")
-
-    t_lines = []
-    if start_text and end_text:
-        t_lines.append(f"🕒 {start_text} → {end_text}")
-    elif start_text:
-        t_lines.append(f"🕒 {start_text}")
-    if t_lines:
-        lines.extend(t_lines)
-
-    text = "\n".join(lines)
-    if to_channel:
-        send_bot_message(text, disable_preview=False)
-        await update.message.reply_text("✅ injected to channel")
-    else:
-        await update.message.reply_html(text, disable_web_page_preview=False)
-
-
-
-
-
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong")
-
-async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Відображає список API-джерел, які бот опитує (за ALL_EXCHANGES).
-    """
-    try:
-        lines = ["Джерела API:"]
-        for ex, mk in ALL_EXCHANGES:
-            lines.append(f"• {ex}/{mk}")
-        await update.message.reply_text("\n".join(lines))
-    except Exception as e:
-        await update.message.reply_text(f"Помилка виводу джерел: {e}")
-
-async def cmd_testpost(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    send_bot_message("<b>✅ Test publish from Crypto Hornet bot.</b>")
-    await update.message.reply_text("Відправив тест у TARGET_CHAT_ID.")
-
-def _parse_preview_args(args: List[str]) -> Tuple[str, Optional[str], int]:
-    """
-    Підтримка:
-      /preview all 2
-      /preview binance 5
-      /preview gate futures 3
-    """
-    ex = "all"
-    mk: Optional[str] = None
-    limit = 3
-    if not args:
-        return ex, mk, limit
-    # перше — ex|all
-    ex = args[0].lower()
-    # друге — market або limit
-    if len(args) >= 2:
-        if args[1].isdigit():
-            limit = int(args[1])
-        else:
-            mk = args[1].lower()
-    # третє — limit (якщо було mk)
-    if len(args) >= 3 and args[2].isdigit():
-        limit = int(args[2])
-    return ex, mk, limit
-
-async def cmd_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /preview all 2
-    /preview binance 5
-    /preview gate futures 3
-    Показує «останній знімок» від API без публікації.
-    """
-    ex, mk, limit = _parse_preview_args(context.args or [])
-    lines: List[str] = []
-
-    def add_block(title: str, items: Dict[str, str]):
-        lines.append(f"<b>{_html(title)}</b>")
-        if not items:
-            lines.append("—")
-            return
-        c = 0
-        for pair, url in items.items():
-            if c >= limit:
-                break
-            url = url or ""
-            if url:
-                lines.append(f"• {_fmt_pair_line(pair)} — <a href=\"{url}\">тикер</a>")
-            else:
-                lines.append(f"• {_fmt_pair_line(pair)}")
-            c += 1
-        lines.append("")
-
-    if ex == "all":
-        for _ex, _mk in ALL_EXCHANGES:
-            snap = api_fetch_snapshot(_ex, _mk)
-            add_block(f"{_ex}/{_mk}", snap)
-    else:
-        # фільтр по біржі (і, опційно, ринку)
-        pairs = [t for t in ALL_EXCHANGES if t[0] == ex and (mk is None or t[1] == mk)]
-        if not pairs:
-            await update.message.reply_text("Невірні аргументи. Приклади: /preview all 2 | /preview binance 5 | /preview gate futures 3")
-            return
-        for _ex, _mk in pairs:
-            snap = api_fetch_snapshot(_ex, _mk)
-            add_block(f"{_ex}/{_mk}", snap)
-
-    # відправляємо приватно
-    try:
-        await update.message.reply_html("\n".join(lines), disable_web_page_preview=True)
-    except Exception:
-        # якщо прив'язаний до каналу — шлемо власнику
-        send_owner("\n".join(lines))
+    send_bot_message(format_event_html(ev))
+    await update.message.reply_text("✅ Ін’єкцію відправлено.")
 
 def build_bot_app():
     if not BOT_TOKEN:
         return None
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("ping",     cmd_ping))
-    app.add_handler(CommandHandler("sources",  cmd_sources))
+    app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("testpost", cmd_testpost))
-    app.add_handler(CommandHandler("preview",  cmd_preview))
+    app.add_handler(CommandHandler("preview", cmd_preview))
     app.add_handler(CommandHandler("inject", cmd_inject))
     return app
 
-# -------------------- API LOOP ------------------------
+# -------------------- API POLLING LOOP ----------------
 async def poll_api_loop():
     """
-    Основний цикл: опитування API всіх бірж, порівняння з попереднім знімком,
-    фільтр через БД (антидубль між рестартами), форматований пост у канал.
+    Основний цикл: періодично тягнемо знімки з API бірж,
+    порівнюємо з попередніми, публікуємо нові пари.
     """
-    # 1) початкові «знімки» всіх бірж/ринків
-    snapshots: Dict[Tuple[str, str], Dict[str, str]] = api_seed_all()
+    # 1) початкові знімки (щоб не було «бурсту» при першому запуску)
+    pairs = monitored_pairs()
+    for ex, mk in pairs:
+        try:
+            snapshot = api_fetch_snapshot(ex, mk)
+            set_prev_snapshot(ex, mk, snapshot)
+            log.info("api seed %s/%s: %d symbols", ex, mk, len(snapshot))
+            await asyncio.sleep(0.2)
+        except Exception as e:
+            log.warning("seed %s/%s error: %s", ex, mk, e)
 
-    # 2) головний цикл
+    # 2) цикл моніторингу
     while True:
         try:
-            for ex, mk in ALL_EXCHANGES:
-                # поточний знімок
-                cur_snap = api_fetch_snapshot(ex, mk)  # {pair->url}
-                prev_snap = snapshots.get((ex, mk), {})
+            for ex, mk in pairs:
+                try:
+                    cur = api_fetch_snapshot(ex, mk)
+                    prev = get_prev_snapshot(ex, mk)
+                    if not isinstance(cur, dict):
+                        cur = {}
+                    evs = api_build_events_from_diff(ex, mk, prev, cur)
 
-                # будуємо події (нові пари, delist і т.д. — залежить від реалізації api_build_events_from_diff)
-                events = api_build_events_from_diff(ex, mk, prev_snap, cur_snap)
+                    # оновлюємо snapshot відразу, щоб не дублювати при наступних ітераціях
+                    set_prev_snapshot(ex, mk, cur)
 
-                # постимо тільки нові (через БД антидубль)
-                for ev in events:
-                    pair = ev.get("pair") or ""
-                    url  = ev.get("url")  or ""
-                    if not pair:
-                        continue
-                    # якщо вже було — не постимо
-                    if not _upsert_seen_pair(ex, mk, pair, url):
-                        continue
+                    # публікація тільки нових (через dedupe ключ)
+                    for ev in evs:
+                        pair = ev.get("pair") or ""
+                        dedupe = f"api://{ex}/{mk}/{pair}"
+                        if not db_mark_new(dedupe):
+                            continue
+                        send_bot_message(format_event_html(ev))
+                        await asyncio.sleep(0.5)  # маленький тротлінг
+                except Exception as e:
+                    log.warning("api loop %s/%s error: %s", ex, mk, e)
 
-                    # час як на біржі (без локалізації), якщо є
-                    start_text = ev.get("start_text") or ""   # те саме, що прийшло з біржі
-                    end_text   = ev.get("end_text") or ""     # кінець, якщо API його дає
-
-                    time_lines = []
-                    if start_text and end_text:
-                        time_lines.append(f"🕒 {_html(start_text)} → {_html(end_text)}")
-                    elif start_text:
-                        time_lines.append(f"🕒 {_html(start_text)}")
-
-                    # заголовок + пара
-                    title_line = f"✅ <b>{_html(ex.upper())}</b> — {_html(mk)} нова пара (API)"
-                    lines = [title_line, f"Пара: {_fmt_pair_line(pair)}"]
-
-                    # додаємо час, якщо є
-                    if time_lines:
-                        lines.extend(time_lines)
-
-                    # посилання на тікер
-                    if url:
-                        lines.append(f"🔗 Тікер: <a href=\"{url}\">{_html(url)}</a>")
-
-                    send_bot_message("\n".join(lines), disable_preview=False)
-
-
-                # оновлюємо кеш знімків у пам'яті
-                snapshots[(ex, mk)] = cur_snap
-
-                # невелика пауза між біржами
-                await asyncio.sleep(0.3 + random.random() * 0.3)
-
-            await asyncio.sleep(API_POLL_SEC)
-
+            await asyncio.sleep(API_PAIRS_INTERVAL_SEC)
         except Exception as e:
-            log.exception("api loop error: %s", e)
+            log.exception("api poll loop error: %s", e)
             await asyncio.sleep(5)
 
-# -------------------- MAIN ---------------------------
+# ---------------------- MAIN --------------------------
 async def main():
     app = build_bot_app()
     api_task = None
     try:
-        if app:
+        if app and ENABLE_POLLING:
+            # запуск TG-команд (polling)
             try:
                 await app.initialize()
                 await app.start()
                 try:
-                    # drop_pending_updates=True — щоб не тягнути старі команди
                     await app.updater.start_polling(drop_pending_updates=True)
-                except Conflict:
-                    # Якщо інший інстанс уже поллінгить (наприклад, локальний) — продовжуємо без команд
-                    log.warning("Updater conflict: already polling elsewhere, continue without commands.")
                 except Exception as e:
-                    raise e
+                    if "Conflict" in str(e):
+                        log.warning("Updater conflict: уже є інстанс, продовжую без команд.")
+                    else:
+                        raise
             except Exception as e:
                 log.exception("Bot init failed: %s", e)
 
-        # запускаємо API-цикл
+        # цикл API-моніторингу
         api_task = asyncio.create_task(poll_api_loop())
 
-        # чекаємо задачі
         wait_tasks = [t for t in (api_task,) if t]
         if wait_tasks:
             await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_EXCEPTION)
@@ -442,4 +466,5 @@ async def main():
             except Exception: pass
 
 if __name__ == "__main__":
+    import requests  # для send_* локального імпорту
     asyncio.run(main())
