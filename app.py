@@ -223,8 +223,7 @@ async def cmd_inject(update, context):
     else:
         await update.message.reply_html(text, disable_web_page_preview=False)
 
-# реєстрація
-app.add_handler(CommandHandler("inject", cmd_inject))
+
 
 
 
@@ -328,6 +327,7 @@ def build_bot_app():
     app.add_handler(CommandHandler("sources",  cmd_sources))
     app.add_handler(CommandHandler("testpost", cmd_testpost))
     app.add_handler(CommandHandler("preview",  cmd_preview))
+    app.add_handler(CommandHandler("inject", cmd_inject))
     return app
 
 # -------------------- API LOOP ------------------------
