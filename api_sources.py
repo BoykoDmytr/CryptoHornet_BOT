@@ -42,18 +42,16 @@ SESSION.headers.update({
     "Pragma": "no-cache",
 })
 
+# чи фільтрувати лише USDT-коти
+ONLY_USDT = (os.getenv("API_ONLY_USDT", "1").lower() not in ("0", "false", "no"))
 HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
 HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
 PROXIES = {"http": HTTP_PROXY, "https": HTTPS_PROXY} if (HTTP_PROXY or HTTPS_PROXY) else None
 
 def _parse_json_text(text: str):
-    """
-    Декодує JSON навіть якщо він подвійно закодований (JSON-рядок усередині JSON-рядка).
-    Повертає dict/list або сирий текст, якщо розпарсити неможливо.
-    """
     try:
         obj = json.loads(text)
-        # Якщо відповідь — рядок, у якому ще один JSON, розкрутимо 2 рази
+        # інколи API повертає JSON-рядок всередині JSON-рядка
         for _ in range(2):
             if isinstance(obj, str):
                 obj = json.loads(obj)
@@ -70,15 +68,13 @@ def _get_json(url: str, params: dict | None = None, headers: dict | None = None,
     r = SESSION.get(url, params=params, headers=h, timeout=timeout, proxies=PROXIES)
     r.raise_for_status()
     ct = (r.headers.get("content-type") or "").lower()
-    # Якщо справжній application/json — пробуємо .json(), інакше валимося у ручний парсер
     if "application/json" in ct:
         try:
-            obj = r.json()
+            return r.json()
         except Exception:
-            obj = _parse_json_text(r.text)
-    else:
-        obj = _parse_json_text(r.text)
-    return obj
+            return _parse_json_text(r.text)
+    return _parse_json_text(r.text)
+
 
 
 def _now_utc_text() -> str:
@@ -220,23 +216,52 @@ def _bitget_futures() -> Dict[str, str]:
 
 # ------------------ MEXC ------------------
 def _mexc_spot() -> Dict[str, str]:
-    j = _get_json("https://api.mexc.com/api/v3/exchangeInfo")
     out: Dict[str, str] = {}
-    symbols = j.get("symbols", []) if isinstance(j, dict) else []
-    # MEXC часто ставить status="ENABLED"
-    ok_status = {"TRADING", "ENABLED", "PENDING_TRADING", "PRE_TRADING"}
-    for it in symbols:
-        base = (it.get("baseAsset") or "").upper()
-        quote = (it.get("quoteAsset") or "").upper()
-        status = (it.get("status") or it.get("state") or "").upper()
+
+    def add_pair(base: str, quote: str):
+        base, quote = (base or "").upper(), (quote or "").upper()
         if not base or not quote:
-            continue
+            return
         if ONLY_USDT and quote != "USDT":
-            continue
-        if status and status not in ok_status:
-            continue
+            return
         out[f"{base}/{quote}"] = f"https://www.mexc.com/exchange/{base}_{quote}"
+
+    # primary: v3
+    try:
+        j = _get_json("https://api.mexc.com/api/v3/exchangeInfo")
+        symbols = j.get("symbols", []) if isinstance(j, dict) else []
+        if symbols:
+            ok_status = {"TRADING", "ENABLED", "PENDING_TRADING", "PRE_TRADING"}
+            for it in symbols:
+                base = it.get("baseAsset")
+                quote = it.get("quoteAsset")
+                status = (it.get("status") or it.get("state") or "").upper()
+                if status and status not in ok_status:
+                    continue
+                add_pair(base, quote)
+    except Exception as e:
+        log.warning("mexc spot v3 error: %s", e)
+
+    # fallback: v2 (деякі регіони/мережі віддають тільки його)
+    if not out:
+        try:
+            j2 = _get_json("https://www.mexc.com/open/api/v2/market/symbols")
+            data = j2.get("data") or []
+            for it in data:
+                # приклади полів: symbol, state, baseCurrency, quoteCurrency
+                base = it.get("baseCurrency") or it.get("base") or ""
+                quote = it.get("quoteCurrency") or it.get("quote") or ""
+                state = (it.get("state") or "").upper()
+                if state and state not in ("ENABLED", "TRADING"):
+                    continue
+                add_pair(base, quote)
+        except Exception as e:
+            log.warning("mexc spot v2 error: %s", e)
+
+    if not out:
+        log.info("mexc/spot: 0 symbols (both v3 & v2 empty). Можливе блокування IP або тимчасова відмова API.")
     return out
+
 
 
 def _mexc_futures() -> Dict[str, str]:
@@ -276,26 +301,44 @@ def _bingx_headers() -> dict:
     return {"X-BX-APIKEY": api_key} if api_key else {}
 
 def _bingx_spot() -> Dict[str, str]:
-    j = _get_json("https://open-api.bingx.com/openApi/spot/v1/common/symbols", headers=_bingx_headers())
-    # Відповідь може бути dict із ключем "data" або одразу list
+    url = "https://open-api.bingx.com/openApi/spot/v1/common/symbols"
+    j = _get_json(url, headers=_bingx_headers())
+
+    # Деякі відповіді приходять як рядок або “оголений” масив
     if isinstance(j, str):
         j = _parse_json_text(j)
-    data = []
-    if isinstance(j, dict):
+
+    data = None
+    # нормальний success-обʼєкт
+    if isinstance(j, dict) and "data" in j:
+        code = j.get("code")
+        if code not in (0, "0", None):
+            log.warning("bingx/spot: non-success code=%s msg=%s", code, j.get("msg"))
+            return {}
         data = j.get("data") or []
+    # інколи віддають одразу масив
     elif isinstance(j, list):
         data = j
+    else:
+        log.warning("bingx/spot: unexpected payload type=%s", type(j).__name__)
+        return {}
+
     out: Dict[str, str] = {}
     for it in data:
-        base = (it.get("baseAsset") if isinstance(it, dict) else None) or ""
-        quote = (it.get("quoteAsset") if isinstance(it, dict) else None) or ""
-        base, quote = base.upper(), quote.upper()
+        if not isinstance(it, dict):
+            continue
+        base = (it.get("baseAsset") or "").upper()
+        quote = (it.get("quoteAsset") or "").upper()
         if not base or not quote:
             continue
         if ONLY_USDT and quote != "USDT":
             continue
         out[f"{base}/{quote}"] = f"https://bingx.com/en-us/spot/{base}_{quote}"
+
+    if not out:
+        log.info("bingx/spot: 0 symbols (ймовірно потрібен BINGX_API_KEY або IP-ліміт).")
     return out
+
 
 
 def _bingx_futures() -> Dict[str, str]:
