@@ -171,6 +171,62 @@ def _upsert_seen_pair(exchange: str, market: str, pair: str, url: Optional[str])
         return True  # на всяк випадок не блокуємо постинг
 
 # -------------------- BOT (команди) -------------------
+# --- TEST: /inject <exchange> <spot|futures> <BASE/QUOTE> [start] [end] [channel]
+async def cmd_inject(update, context):
+    args = (context.args or [])
+    if len(args) < 3:
+        return await update.message.reply_text(
+            "usage:\n"
+            "/inject <exchange> <spot|futures> <BASE/QUOTE> [start_text] [end_text] [channel]\n"
+            "example:\n"
+            "/inject gate spot BTC/USDT \"2025-10-07 13:00 UTC+8\" \"2025-10-07 15:00 UTC+8\" channel"
+        )
+    ex = args[0].lower()
+    mk = args[1].lower()
+    pair = args[2].upper()
+    start_text = args[3] if len(args) >= 4 else ""
+    end_text   = args[4] if len(args) >= 5 else ""
+    to_channel = (len(args) >= 6 and args[5].lower() == "channel")
+
+    base, quote = (pair.split("/", 1) + [""])[:2]
+    ev = {
+        "exchange": ex,
+        "market": mk,
+        "pair": pair,
+        "base": base,
+        "quote": quote,
+        "url": "",
+        "title": "тестова пара (API inject)",
+        "start_text": start_text,
+        "end_text": end_text,
+        "start_dt": None,
+    }
+
+    # той самий рендер, що і для реальних API-івентів
+    lines = []
+    title_line = f"✅ <b>{ex.upper()}</b> — {mk} нова пара (API)"
+    lines.append(title_line)
+    lines.append(f"Пара: <code>{pair}</code>")
+
+    t_lines = []
+    if start_text and end_text:
+        t_lines.append(f"🕒 {start_text} → {end_text}")
+    elif start_text:
+        t_lines.append(f"🕒 {start_text}")
+    if t_lines:
+        lines.extend(t_lines)
+
+    text = "\n".join(lines)
+    if to_channel:
+        send_bot_message(text, disable_preview=False)
+        await update.message.reply_text("✅ injected to channel")
+    else:
+        await update.message.reply_html(text, disable_web_page_preview=False)
+
+
+
+
+
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
 
@@ -271,6 +327,7 @@ def build_bot_app():
     app.add_handler(CommandHandler("sources",  cmd_sources))
     app.add_handler(CommandHandler("testpost", cmd_testpost))
     app.add_handler(CommandHandler("preview",  cmd_preview))
+    app.add_handler(CommandHandler("inject", cmd_inject))
     return app
 
 # -------------------- API LOOP ------------------------
@@ -304,23 +361,29 @@ async def poll_api_loop():
                         continue
 
                     # час як на біржі (без локалізації), якщо є
-                    start_text = ev.get("start_text") or ""  # вже як «сирий» з біржі
-                    end_text   = ev.get("end_text")   or ""
+                    start_text = ev.get("start_text") or ""   # те саме, що прийшло з біржі
+                    end_text   = ev.get("end_text") or ""     # кінець, якщо API його дає
+
                     time_lines = []
                     if start_text and end_text:
                         time_lines.append(f"🕒 {_html(start_text)} → {_html(end_text)}")
                     elif start_text:
                         time_lines.append(f"🕒 {_html(start_text)}")
 
-                    # заголовок
+                    # заголовок + пара
                     title_line = f"✅ <b>{_html(ex.upper())}</b> — {_html(mk)} нова пара (API)"
                     lines = [title_line, f"Пара: {_fmt_pair_line(pair)}"]
+
+                    # додаємо час, якщо є
                     if time_lines:
                         lines.extend(time_lines)
+
+                    # посилання на тікер
                     if url:
                         lines.append(f"🔗 Тікер: <a href=\"{url}\">{_html(url)}</a>")
 
-                    send_bot_message("\n".join(lines))
+                    send_bot_message("\n".join(lines), disable_preview=False)
+
 
                 # оновлюємо кеш знімків у пам'яті
                 snapshots[(ex, mk)] = cur_snap
