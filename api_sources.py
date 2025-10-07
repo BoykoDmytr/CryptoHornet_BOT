@@ -46,6 +46,23 @@ HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
 HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
 PROXIES = {"http": HTTP_PROXY, "https": HTTPS_PROXY} if (HTTP_PROXY or HTTPS_PROXY) else None
 
+def _parse_json_text(text: str):
+    """
+    Декодує JSON навіть якщо він подвійно закодований (JSON-рядок усередині JSON-рядка).
+    Повертає dict/list або сирий текст, якщо розпарсити неможливо.
+    """
+    try:
+        obj = json.loads(text)
+        # Якщо відповідь — рядок, у якому ще один JSON, розкрутимо 2 рази
+        for _ in range(2):
+            if isinstance(obj, str):
+                obj = json.loads(obj)
+            else:
+                break
+        return obj
+    except Exception:
+        return text
+
 def _get_json(url: str, params: dict | None = None, headers: dict | None = None, timeout: int = 25):
     h = dict(SESSION.headers)
     if headers:
@@ -53,13 +70,16 @@ def _get_json(url: str, params: dict | None = None, headers: dict | None = None,
     r = SESSION.get(url, params=params, headers=h, timeout=timeout, proxies=PROXIES)
     r.raise_for_status()
     ct = (r.headers.get("content-type") or "").lower()
-    if "application/json" not in ct:
-        # деякі API віддають text/plain
+    # Якщо справжній application/json — пробуємо .json(), інакше валимося у ручний парсер
+    if "application/json" in ct:
         try:
-            return json.loads(r.text)
+            obj = r.json()
         except Exception:
-            pass
-    return r.json()
+            obj = _parse_json_text(r.text)
+    else:
+        obj = _parse_json_text(r.text)
+    return obj
+
 
 def _now_utc_text() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -202,18 +222,22 @@ def _bitget_futures() -> Dict[str, str]:
 def _mexc_spot() -> Dict[str, str]:
     j = _get_json("https://api.mexc.com/api/v3/exchangeInfo")
     out: Dict[str, str] = {}
-    for it in j.get("symbols", []) or []:
+    symbols = j.get("symbols", []) if isinstance(j, dict) else []
+    # MEXC часто ставить status="ENABLED"
+    ok_status = {"TRADING", "ENABLED", "PENDING_TRADING", "PRE_TRADING"}
+    for it in symbols:
         base = (it.get("baseAsset") or "").upper()
         quote = (it.get("quoteAsset") or "").upper()
-        status = (it.get("status") or "").upper()
+        status = (it.get("status") or it.get("state") or "").upper()
         if not base or not quote:
-            continue
-        if status not in ("TRADING", "PENDING_TRADING", "PRE_TRADING"):
             continue
         if ONLY_USDT and quote != "USDT":
             continue
+        if status and status not in ok_status:
+            continue
         out[f"{base}/{quote}"] = f"https://www.mexc.com/exchange/{base}_{quote}"
     return out
+
 
 def _mexc_futures() -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -253,11 +277,19 @@ def _bingx_headers() -> dict:
 
 def _bingx_spot() -> Dict[str, str]:
     j = _get_json("https://open-api.bingx.com/openApi/spot/v1/common/symbols", headers=_bingx_headers())
-    data = j.get("data") or []
+    # Відповідь може бути dict із ключем "data" або одразу list
+    if isinstance(j, str):
+        j = _parse_json_text(j)
+    data = []
+    if isinstance(j, dict):
+        data = j.get("data") or []
+    elif isinstance(j, list):
+        data = j
     out: Dict[str, str] = {}
     for it in data:
-        base = (it.get("baseAsset") or "").upper()
-        quote = (it.get("quoteAsset") or "").upper()
+        base = (it.get("baseAsset") if isinstance(it, dict) else None) or ""
+        quote = (it.get("quoteAsset") if isinstance(it, dict) else None) or ""
+        base, quote = base.upper(), quote.upper()
         if not base or not quote:
             continue
         if ONLY_USDT and quote != "USDT":
@@ -265,19 +297,35 @@ def _bingx_spot() -> Dict[str, str]:
         out[f"{base}/{quote}"] = f"https://bingx.com/en-us/spot/{base}_{quote}"
     return out
 
+
 def _bingx_futures() -> Dict[str, str]:
     j = _get_json("https://open-api.bingx.com/openApi/swap/v2/quote/contracts", headers=_bingx_headers())
-    data = (j.get("data") or {}).get("contracts") or j.get("data") or []
+    if isinstance(j, str):
+        j = _parse_json_text(j)
+
+    # Може бути:
+    # { "data": {"contracts": [...] } } або { "data": [...] } або просто [...]
+    data = []
+    if isinstance(j, dict):
+        data = (j.get("data") or {})
+        if isinstance(data, dict):
+            data = data.get("contracts") or data.get("list") or []
+    elif isinstance(j, list):
+        data = j
+
     out: Dict[str, str] = {}
-    for it in data:
-        s = (it.get("symbol") or it.get("contractName") or "").upper()  # BTC-USDT
+    for it in data or []:
+        s = ""
+        if isinstance(it, dict):
+            s = (it.get("symbol") or it.get("contractName") or "").upper()
+        elif isinstance(it, str):
+            s = it.upper()
         if not s:
             continue
-        s = s.replace("-", "")
+        s = s.replace("-", "")  # BTC-USDT -> BTCUSDT
         if ONLY_USDT and not s.endswith("USDT"):
             continue
-        base = s[:-4]
-        quote = "USDT"
+        base, quote = s[:-4], "USDT"
         out[f"{base}/{quote}"] = f"https://bingx.com/en-us/futures/{base}{quote}"
     return out
 
