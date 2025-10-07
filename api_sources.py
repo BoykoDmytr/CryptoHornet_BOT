@@ -215,7 +215,7 @@ def _bitget_futures() -> Dict[str, str]:
     return out
 
 # ------------------ MEXC ------------------
-def _mexc_spot() -> Dict[str, str]:
+#def _mexc_spot() -> Dict[str, str]:
     """
     Основний: /api/v3/exchangeInfo
     Фолбек:   /api/v3/ticker/price  (будуємо пари з символів)
