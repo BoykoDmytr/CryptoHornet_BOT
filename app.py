@@ -304,29 +304,23 @@ async def poll_api_loop():
                         continue
 
                     # час як на біржі (без локалізації), якщо є
-                    start_text = ev.get("start_text") or ""   # те саме, що прийшло з біржі
-                    end_text   = ev.get("end_text") or ""     # кінець, якщо API його дає
-
+                    start_text = ev.get("start_text") or ""  # вже як «сирий» з біржі
+                    end_text   = ev.get("end_text")   or ""
                     time_lines = []
                     if start_text and end_text:
                         time_lines.append(f"🕒 {_html(start_text)} → {_html(end_text)}")
                     elif start_text:
                         time_lines.append(f"🕒 {_html(start_text)}")
 
-                    # заголовок + пара
+                    # заголовок
                     title_line = f"✅ <b>{_html(ex.upper())}</b> — {_html(mk)} нова пара (API)"
                     lines = [title_line, f"Пара: {_fmt_pair_line(pair)}"]
-
-                    # додаємо час, якщо є
                     if time_lines:
                         lines.extend(time_lines)
-
-                    # посилання на тікер
                     if url:
                         lines.append(f"🔗 Тікер: <a href=\"{url}\">{_html(url)}</a>")
 
-                    send_bot_message("\n".join(lines), disable_preview=False)
-
+                    send_bot_message("\n".join(lines))
 
                 # оновлюємо кеш знімків у пам'яті
                 snapshots[(ex, mk)] = cur_snap
