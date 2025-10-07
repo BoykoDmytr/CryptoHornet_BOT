@@ -9,26 +9,26 @@ from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional
 import datetime as _dt
 import pytz as _pytz
-
 import requests
 
 log = logging.getLogger("hornet.api")
 
+# Таймзони для довідки/логів (видруковуємо "detected:")
 EXCHANGE_TZ = {
-    "binance": _pytz.utc,                      # Binance оголошення в UTC
-    "okx": _pytz.utc,                          # OKX також публікує в UTC
-    "gate": _pytz.timezone("Asia/Shanghai"),   # Gate часто використовує UTC+8 (Шанхай)
-    "bitget": _pytz.timezone("Asia/Singapore"),# Bitget здебільшого UTC+8 у матеріалах
-    "mexc": _pytz.timezone("Asia/Singapore"),  # MEXC зазвичай UTC+8
-    "bingx": _pytz.timezone("Asia/Singapore"), # BingX UTC+8
-    "bybit": _pytz.timezone("Asia/Singapore"), # Bybit UTC+8
-    "bithumb": _pytz.timezone("Asia/Seoul"),   # Bithumb KST
-    "upbit": _pytz.timezone("Asia/Seoul"),     # Upbit KST
+    "binance": _pytz.utc,
+    "okx": _pytz.utc,
+    "gate": _pytz.timezone("Asia/Shanghai"),
+    "bitget": _pytz.timezone("Asia/Singapore"),
+    "mexc": _pytz.timezone("Asia/Singapore"),
+    "bingx": _pytz.timezone("Asia/Singapore"),
+    "bybit": _pytz.timezone("Asia/Singapore"),
+    "bithumb": _pytz.timezone("Asia/Seoul"),
+    "upbit": _pytz.timezone("Asia/Seoul"),
 }
 
-# -------------------------------------------------------
-# HTTP session (стабільні заголовки + необов'язковий проксі)
-# -------------------------------------------------------
+ONLY_USDT = os.getenv("API_ONLY_USDT", "1") == "1"
+
+# ------------------ HTTP session ------------------
 SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": (
@@ -52,8 +52,8 @@ def _get_json(url: str, params: dict | None = None, headers: dict | None = None,
         h.update(headers)
     r = SESSION.get(url, params=params, headers=h, timeout=timeout, proxies=PROXIES)
     r.raise_for_status()
-    ct = r.headers.get("content-type", "")
-    if "application/json" not in ct and not r.text.strip().startswith(("{", "[")):
+    ct = (r.headers.get("content-type") or "").lower()
+    if "application/json" not in ct:
         # деякі API віддають text/plain
         try:
             return json.loads(r.text)
@@ -64,60 +64,38 @@ def _get_json(url: str, params: dict | None = None, headers: dict | None = None,
 def _now_utc_text() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-# ---------------------------------------------------------------------
-# УНІФІКОВАНИЙ ІНТЕРФЕЙС
-# ---------------------------------------------------------------------
-# api_fetch_snapshot(exchange, market) -> Dict["BASE/QUOTE", "url-to-ticker"]
-#   exchange ∈ {"binance","okx","gate","bitget","mexc","bingx","bybit","bithumb","upbit"}
-#   market   ∈ {"spot","futures"}
-#
-# api_build_events_from_diff(exchange, market, prev_pairs, cur_pairs) -> List[event dict]
-#   перетворює Δ у список подій для публікації
-#
-# api_preview(exchange, market, limit=5) -> List[event dict]
-#   повертає "фейкові нові" події для швидкого тесту бота (без очікувань)
-
 def api_now_exchange_iso(exchange: str) -> str:
-    """
-    Повертає поточний час у таймзоні біржі у форматі 'YYYY-MM-DD HH:MM TZ'.
-    Використовується лише для виводу/логів.
-    """
     tz = EXCHANGE_TZ.get((exchange or "").lower(), _pytz.utc)
     return _dt.datetime.now(tz).strftime("%Y-%m-%d %H:%M %Z")
 
 SUPPORTED: Dict[str, Tuple[bool, bool]] = {
-    # exchange: (has_spot, has_futures)
     "binance": (True, True),
     "okx":     (True, True),
     "gate":    (True, True),
     "bitget":  (True, True),
-    "mexc":    (True, True),   # spot + USDT-M contracts
-    "bingx":   (True, True),   # публічні ендпоїнти можуть вимагати ключ (опційно)
+    "mexc":    (True, True),
+    "bingx":   (True, True),
     "bybit":   (True, True),
-    "bithumb": (True, False),  # лише spot
-    "upbit":   (True, False),  # лише spot (у т.ч. USDT-ринок)
+    "bithumb": (True, False),
+    "upbit":   (True, False),
 }
 
-# --------------------------------------
-# BINANCE
-# --------------------------------------
+# ------------------ BINANCE ------------------
 def _binance_spot() -> Dict[str, str]:
-    # https://api.binance.com/api/v3/exchangeInfo
     j = _get_json("https://api.binance.com/api/v3/exchangeInfo")
     out: Dict[str, str] = {}
     for s in j.get("symbols", []):
         if s.get("status") != "TRADING":
             continue
-        base, quote = s.get("baseAsset"), s.get("quoteAsset")
+        base, quote = (s.get("baseAsset") or "").upper(), (s.get("quoteAsset") or "").upper()
         if not base or not quote:
             continue
-        pair = f"{base}/{quote}"
-        url  = f"https://www.binance.com/en/trade/{base}_{quote}"
-        out[pair] = url
+        if ONLY_USDT and quote != "USDT":
+            continue
+        out[f"{base}/{quote}"] = f"https://www.binance.com/en/trade/{base}_{quote}"
     return out
 
 def _binance_futures() -> Dict[str, str]:
-    # USDT-M perpetual
     j = _get_json("https://fapi.binance.com/fapi/v1/exchangeInfo")
     out: Dict[str, str] = {}
     for s in j.get("symbols", []):
@@ -125,131 +103,106 @@ def _binance_futures() -> Dict[str, str]:
             continue
         if s.get("contractType") != "PERPETUAL":
             continue
-        base, quote = s.get("baseAsset"), s.get("quoteAsset")
+        base, quote = (s.get("baseAsset") or "").upper(), (s.get("quoteAsset") or "").upper()
         if not base or not quote:
             continue
-        pair = f"{base}/{quote}"
-        url  = f"https://www.binance.com/en/futures/{base}{quote}"
-        out[pair] = url
+        if ONLY_USDT and quote != "USDT":
+            continue
+        out[f"{base}/{quote}"] = f"https://www.binance.com/en/futures/{base}{quote}"
     return out
 
-# --------------------------------------
-# OKX
-# --------------------------------------
+# ------------------ OKX ------------------
 def _okx_spot() -> Dict[str, str]:
-    # https://www.okx.com/api/v5/public/instruments?instType=SPOT
     j = _get_json("https://www.okx.com/api/v5/public/instruments", params={"instType": "SPOT"})
     out: Dict[str, str] = {}
     for it in j.get("data", []):
-        inst_id = it.get("instId")  # e.g. BTC-USDT
+        inst_id = it.get("instId")  # BTC-USDT
         if not inst_id or "-" not in inst_id:
             continue
-        base, quote = inst_id.split("-")[0], inst_id.split("-")[1]
-        url  = f"https://www.okx.com/trade-spot/{base}-{quote}"
-        out[f"{base}/{quote}"] = url
+        base, quote = inst_id.split("-")[0].upper(), inst_id.split("-")[1].upper()
+        if ONLY_USDT and quote != "USDT":
+            continue
+        out[f"{base}/{quote}"] = f"https://www.okx.com/trade-spot/{base}-{quote}"
     return out
 
 def _okx_futures() -> Dict[str, str]:
-    # беремо SWAP (perpetual)
     j = _get_json("https://www.okx.com/api/v5/public/instruments", params={"instType": "SWAP"})
     out: Dict[str, str] = {}
     for it in j.get("data", []):
-        inst_id = it.get("instId")  # e.g. BTC-USDT-SWAP
+        inst_id = it.get("instId")  # BTC-USDT-SWAP
         if not inst_id or "-" not in inst_id:
             continue
         parts = inst_id.split("-")
         if len(parts) < 2:
             continue
-        base, quote = parts[0], parts[1]
-        url  = f"https://www.okx.com/trade-swap/{base}-{quote}-SWAP"
-        out[f"{base}/{quote}"] = url
+        base, quote = parts[0].upper(), parts[1].upper()
+        if ONLY_USDT and quote != "USDT":
+            continue
+        out[f"{base}/{quote}"] = f"https://www.okx.com/trade-swap/{base}-{quote}-SWAP"
     return out
 
-# --------------------------------------
-# GATE
-# --------------------------------------
+# ------------------ GATE ------------------
 def _gate_spot() -> Dict[str, str]:
-    # https://api.gateio.ws/api/v4/spot/currency_pairs
     j = _get_json("https://api.gateio.ws/api/v4/spot/currency_pairs")
     out: Dict[str, str] = {}
     for it in j:
-        base, quote = it.get("base"), it.get("quote")
+        base, quote = (it.get("base") or "").upper(), (it.get("quote") or "").upper()
         if not base or not quote:
             continue
-        pair = f"{base}/{quote}"
-        url  = f"https://www.gate.io/trade/{base}_{quote}"
-        out[pair] = url
+        if ONLY_USDT and quote != "USDT":
+            continue
+        out[f"{base}/{quote}"] = f"https://www.gate.io/trade/{base}_{quote}"
     return out
 
 def _gate_futures() -> Dict[str, str]:
-    # https://api.gateio.ws/api/v4/futures/usdt/contracts
     j = _get_json("https://api.gateio.ws/api/v4/futures/usdt/contracts")
     out: Dict[str, str] = {}
     for it in j:
-        name = it.get("name")  # e.g. BTC_USDT
-        if not name or "_" not in name:
+        name = (it.get("name") or "").upper()  # BTC_USDT
+        if "_" not in name:
             continue
-        base, quote = name.split("_")[0], name.split("_")[1]
-        pair = f"{base}/{quote}"
-        url  = f"https://www.gate.io/futures_trade/USDT/{base}_{quote}"
-        out[pair] = url
+        base, quote = name.split("_", 1)[0], name.split("_", 1)[1]
+        if ONLY_USDT and quote != "USDT":
+            continue
+        out[f"{base}/{quote}"] = f"https://www.gate.io/futures_trade/USDT/{base}_{quote}"
     return out
 
-# --------------------------------------
-# BITGET
-# --------------------------------------
-# --- BITGET SPOT (fixed endpoint) ---
-def bitget_spot_symbols(only_usdt: bool = True) -> list[str]:
-    """
-    Bitget spot products: GET /api/spot/v1/public/products
-    doc: https://api.bitget.com ... (official docs list this endpoint)
-    """
-    url = "https://api.bitget.com/api/spot/v1/public/products"
-    r = _fetch(url)
-    j = r.json()
-    items = j.get("data") or []
-    out = []
-    for it in items:
-        # fields: baseCoin, quoteCoin, symbol, status ...
-        sym = (it.get("symbol") or "").upper()  # e.g. BTCUSDT
-        if not sym:
+# ------------------ BITGET ------------------
+def _bitget_spot() -> Dict[str, str]:
+    # правильний ендпоїнт: /api/spot/v1/public/products
+    j = _get_json("https://api.bitget.com/api/spot/v1/public/products")
+    out: Dict[str, str] = {}
+    for it in j.get("data", []) or []:
+        base = (it.get("baseCoin") or "").upper()
+        quote = (it.get("quoteCoin") or "").upper()
+        sym = (it.get("symbol") or "").upper()  # BTCUSDT
+        if not base or not quote or not sym:
             continue
-        if only_usdt:
-            # accept USDT quotes only
-            q = (it.get("quoteCoin") or "").upper()
-            if q != "USDT":
-                continue
-        out.append(sym)
-    return sorted(set(out))
+        if ONLY_USDT and quote != "USDT":
+            continue
+        out[f"{base}/{quote}"] = f"https://www.bitget.com/spot/{base}{quote}"
+    return out
 
 def _bitget_futures() -> Dict[str, str]:
     # USDT-M perpetuals (productType=umcbl)
     j = _get_json("https://api.bitget.com/api/mix/v1/market/contracts", params={"productType": "umcbl"})
     out: Dict[str, str] = {}
-    for it in j.get("data", []):
-        sym = it.get("symbol")  # e.g. BTCUSDT_UMCBL
-        if not sym or "USDT" not in sym:
+    for it in j.get("data", []) or []:
+        sym = (it.get("symbol") or "").upper()  # BTCUSDT_UMCBL
+        if "USDT" not in sym:
             continue
         base = sym.split("USDT")[0]
         quote = "USDT"
-        pair = f"{base}/{quote}"
-        url  = f"https://www.bitget.com/mix/usdt/{base}{quote}"
-        out[pair] = url
+        if ONLY_USDT and quote != "USDT":
+            continue
+        out[f"{base}/{quote}"] = f"https://www.bitget.com/mix/usdt/{base}{quote}"
     return out
 
-# --------------------------------------
-# MEXC
-# --------------------------------------
-# --- MEXC SPOT (fixed) ---
-def mexc_spot_symbols(only_usdt: bool = True) -> list[str]:
-    """
-    MEXC spot exchange info: GET /api/v3/exchangeInfo
-    """
-    url = "https://api.mexc.com/api/v3/exchangeInfo"
-    j = _fetch(url).json()
-    syms = j.get("symbols") or []
-    out = []
-    for it in syms:
+# ------------------ MEXC ------------------
+def _mexc_spot() -> Dict[str, str]:
+    j = _get_json("https://api.mexc.com/api/v3/exchangeInfo")
+    out: Dict[str, str] = {}
+    for it in j.get("symbols", []) or []:
         base = (it.get("baseAsset") or "").upper()
         quote = (it.get("quoteAsset") or "").upper()
         status = (it.get("status") or "").upper()
@@ -257,17 +210,13 @@ def mexc_spot_symbols(only_usdt: bool = True) -> list[str]:
             continue
         if status not in ("TRADING", "PENDING_TRADING", "PRE_TRADING"):
             continue
-        if only_usdt and quote != "USDT":
+        if ONLY_USDT and quote != "USDT":
             continue
-        out.append(f"{base}{quote}")
-    return sorted(set(out))
+        out[f"{base}/{quote}"] = f"https://www.mexc.com/exchange/{base}_{quote}"
+    return out
 
 def _mexc_futures() -> Dict[str, str]:
-    # Список контрактів USDT-M (перпетуали).
-    # Документація MEXC контрактів: https://mxcdevelop.github.io/apidocs/contract_v1_en/#public-api
-    # Працює ендпоїнт /api/v1/contract/detail або /api/v1/contract/list — спробуємо обидва.
     out: Dict[str, str] = {}
-    tried = []
     for url in [
         "https://contract.mexc.com/api/v1/contract/detail",
         "https://contract.mexc.com/api/v1/contract/list",
@@ -278,120 +227,91 @@ def _mexc_futures() -> Dict[str, str]:
             if isinstance(data, dict):
                 data = data.get("symbols") or data.get("list") or []
             for it in data or []:
-                # name / symbol варіюється. Часто: "symbol": "BTC_USDT"
-                sym = it.get("symbol") or it.get("instrument_id") or it.get("contractId")
+                sym = (it.get("symbol") or it.get("instrument_id") or it.get("contractId") or "")
                 if not sym:
                     continue
-                if isinstance(sym, int):
-                    continue
-                s = str(sym)
-                base, quote = None, None
+                s = str(sym).upper()  # BTC_USDT або BTCUSDT
                 if "_" in s:
                     base, quote = s.split("_", 1)[0], s.split("_", 1)[1]
                 elif s.endswith("USDT"):
                     base, quote = s[:-4], "USDT"
-                if not base or not quote:
+                else:
                     continue
-                pair = f"{base}/{quote}"
-                urlp = f"https://www.mexc.com/futures/{base}_{quote}"
-                out[pair] = urlp
+                if ONLY_USDT and quote != "USDT":
+                    continue
+                out[f"{base}/{quote}"] = f"https://www.mexc.com/futures/{base}_{quote}"
             if out:
                 return out
-            tried.append(url)
-        except Exception as e:
-            tried.append(f"{url} ({e})")
+        except Exception:
             continue
-    if not out:
-        log.info("mexc futures: empty (tried: %s)", "; ".join(tried))
     return out
 
-# --------------------------------------
-# BINGX  (може вимагати API-ключ; якщо є — ставимо в заголовок)
-# --------------------------------------
+# ------------------ BINGX ------------------
 def _bingx_headers() -> dict:
     api_key = os.getenv("BINGX_API_KEY", "").strip()
     return {"X-BX-APIKEY": api_key} if api_key else {}
 
-# --- BINGX SPOT (fixed) ---
-def bingx_spot_symbols(only_usdt: bool = True) -> list[str]:
-    """
-    BingX spot symbols: GET /openApi/spot/v1/common/symbols
-    Returns list with fields like: symbol, baseAsset, quoteAsset, status...
-    """
-    url = "https://open-api.bingx.com/openApi/spot/v1/common/symbols"
-    j = _fetch(url).json()
+def _bingx_spot() -> Dict[str, str]:
+    j = _get_json("https://open-api.bingx.com/openApi/spot/v1/common/symbols", headers=_bingx_headers())
     data = j.get("data") or []
-    out = []
+    out: Dict[str, str] = {}
     for it in data:
         base = (it.get("baseAsset") or "").upper()
         quote = (it.get("quoteAsset") or "").upper()
         if not base or not quote:
             continue
-        if only_usdt and quote != "USDT":
+        if ONLY_USDT and quote != "USDT":
             continue
-        out.append(f"{base}{quote}")
-    return sorted(set(out))
+        out[f"{base}/{quote}"] = f"https://bingx.com/en-us/spot/{base}_{quote}"
+    return out
 
-# --- BINGX FUTURES (fixed) ---
-def bingx_futures_symbols(only_usdt: bool = True) -> list[str]:
-    """
-    BingX futures contracts: GET /openApi/swap/v2/quote/contracts
-    Contract symbol often like 'BTC-USDT' -> normalize to BTCUSDT
-    """
-    url = "https://open-api.bingx.com/openApi/swap/v2/quote/contracts"
-    j = _fetch(url).json()
+def _bingx_futures() -> Dict[str, str]:
+    j = _get_json("https://open-api.bingx.com/openApi/swap/v2/quote/contracts", headers=_bingx_headers())
     data = (j.get("data") or {}).get("contracts") or j.get("data") or []
-    out = []
+    out: Dict[str, str] = {}
     for it in data:
-        s = (it.get("symbol") or it.get("contractName") or "").upper()  # e.g. BTC-USDT
+        s = (it.get("symbol") or it.get("contractName") or "").upper()  # BTC-USDT
         if not s:
             continue
         s = s.replace("-", "")
-        if only_usdt and not s.endswith("USDT"):
+        if ONLY_USDT and not s.endswith("USDT"):
             continue
-        out.append(s)
-    return sorted(set(out))
+        base = s[:-4]
+        quote = "USDT"
+        out[f"{base}/{quote}"] = f"https://bingx.com/en-us/futures/{base}{quote}"
+    return out
 
-# --------------------------------------
-# BYBIT
-# --------------------------------------
+# ------------------ BYBIT ------------------
 def _bybit_spot() -> Dict[str, str]:
-    # https://api.bybit.com/v5/market/instruments-info?category=spot
     j = _get_json("https://api.bybit.com/v5/market/instruments-info", params={"category": "spot"})
+    items = j.get("result", {}).get("list", []) or []
     out: Dict[str, str] = {}
-    for page in j.get("result", {}).get("list", []):
-        for it in page.get("list", []) if "list" in page else [page]:
-            sym = it.get("symbol")  # e.g. BTCUSDT
-            if not sym or "USDT" not in sym:
-                continue
-            base = sym.split("USDT")[0]
-            pair = f"{base}/USDT"
-            url  = f"https://www.bybit.com/en/trade/spot/{base}/USDT"
-            out[pair] = url
+    for it in items:
+        sym = (it.get("symbol") or "").upper()  # BTCUSDT
+        if not sym:
+            continue
+        if ONLY_USDT and not sym.endswith("USDT"):
+            continue
+        base, quote = sym[:-4], "USDT" if sym.endswith("USDT") else sym[-3:]
+        out[f"{base}/{quote}"] = f"https://www.bybit.com/en/trade/spot/{base}/USDT"
     return out
 
 def _bybit_futures() -> Dict[str, str]:
-    # linear USDT perpetual
     j = _get_json("https://api.bybit.com/v5/market/instruments-info", params={"category": "linear"})
+    items = j.get("result", {}).get("list", []) or []
     out: Dict[str, str] = {}
-    for page in j.get("result", {}).get("list", []):
-        for it in page.get("list", []) if "list" in page else [page]:
-            sym = it.get("symbol")  # e.g. BTCUSDT
-            if not sym or "USDT" not in sym:
-                continue
-            base = sym.split("USDT")[0]
-            pair = f"{base}/USDT"
-            url  = f"https://www.bybit.com/en/trade/usdt/{base}USDT"
-            out[pair] = url
+    for it in items:
+        sym = (it.get("symbol") or "").upper()
+        if not sym:
+            continue
+        if ONLY_USDT and not sym.endswith("USDT"):
+            continue
+        base, quote = sym[:-4], "USDT" if sym.endswith("USDT") else sym[-3:]
+        out[f"{base}/{quote}"] = f"https://www.bybit.com/en/trade/usdt/{base}USDT"
     return out
 
-# --------------------------------------
-# BITHUMB (spot тільки; в основному KRW ринки, але залишимо всі)
-# --------------------------------------
+# ------------------ BITHUMB (spot) ------------------
 def _bithumb_spot() -> Dict[str, str]:
-    # Візьмемо список торгових пар — побудуємо URL до web-тікера.
-    # Публічний ендпоїнт (неофіційний) зі списком: https://api.bithumb.com/public/ticker/ALL
-    # Дає tickers по ринках (KRW, BTC, USDT). Візьмемо ключі з "data".
     try:
         j = _get_json("https://api.bithumb.com/public/ticker/ALL")
     except Exception:
@@ -401,33 +321,27 @@ def _bithumb_spot() -> Dict[str, str]:
     for sym, payload in data.items():
         if not isinstance(payload, dict):
             continue
-        # побудуємо кілька можливих ринків
-        for quote in ("USDT", "KRW", "BTC"):
-            pair = f"{sym}/{quote}"
-            url  = f"https://www.bithumb.com/trade/order/{sym}_{quote}"
-            out[pair] = url
+        # формуємо декілька ринків, USDT залишимо обов'язково
+        quotes = ("USDT",) if ONLY_USDT else ("USDT", "KRW", "BTC")
+        for quote in quotes:
+            out[f"{sym}/{quote}"] = f"https://www.bithumb.com/trade/order/{sym}_{quote}"
     return out
 
-# --------------------------------------
-# UPBIT (spot тільки)
-# --------------------------------------
+# ------------------ UPBIT (spot) ------------------
 def _upbit_spot() -> Dict[str, str]:
-    # https://api.upbit.com/v1/market/all
     j = _get_json("https://api.upbit.com/v1/market/all")
     out: Dict[str, str] = {}
     for it in j:
-        market = it.get("market")  # e.g. KRW-BTC, USDT-BTC
+        market = it.get("market")  # KRW-BTC, USDT-BTC
         if not market or "-" not in market:
             continue
-        quote, base = market.split("-")[0], market.split("-")[1]
-        pair = f"{base}/{quote}"
-        url  = f"https://upbit.com/exchange?code=CRIX.UPBIT.{quote}-{base}"
-        out[pair] = url
+        quote, base = market.split("-")[0].upper(), market.split("-")[1].upper()
+        if ONLY_USDT and quote != "USDT":
+            continue
+        out[f"{base}/{quote}"] = f"https://upbit.com/exchange?code=CRIX.UPBIT.{quote}-{base}"
     return out
 
-# ---------------------------------------------------------------------
-# Головна точка: знімки для біржі/ринку
-# ---------------------------------------------------------------------
+# ------------------ API entrypoints ------------------
 def api_fetch_snapshot(exchange: str, market: str) -> Dict[str, str]:
     ex = exchange.lower().strip()
     mk = market.lower().strip()
@@ -469,22 +383,14 @@ def api_fetch_snapshot(exchange: str, market: str) -> Dict[str, str]:
 
     return {}
 
-# ---------------------------------------------------------------------
-# Побудова подій з різниці (Δ) між знімками
-# ---------------------------------------------------------------------
 def api_build_events_from_diff(
     exchange: str,
     market: str,
     prev_pairs: Dict[str, str] | None,
     cur_pairs: Dict[str, str],
 ) -> List[dict]:
-    """
-    prev_pairs / cur_pairs: dict pair -> url
-    Повертає список подій (тільки нові пари, яких не було у prev_pairs).
-    """
     prev_keys = set(prev_pairs.keys()) if prev_pairs else set()
     events: List[dict] = []
-
     for pair, url in cur_pairs.items():
         if pair in prev_keys:
             continue
@@ -498,17 +404,11 @@ def api_build_events_from_diff(
             "url": url,
             "title": "нова пара (API)",
             "start_text": f"detected: {_now_utc_text()}",
-            "start_dt": None,  # немає «часу запуску» від API
+            "start_dt": None,
         })
     return events
 
-# ---------------------------------------------------------------------
-# Прев’ю для тестів (без реальних лістингів)
-# ---------------------------------------------------------------------
 def api_preview(exchange: str, market: str, limit: int = 5) -> List[dict]:
-    """
-    Повертає перші N пар як "фейкові нові" — зручно для перевірки формату постів.
-    """
     snap = api_fetch_snapshot(exchange, market)
     events = []
     i = 0
@@ -530,9 +430,6 @@ def api_preview(exchange: str, market: str, limit: int = 5) -> List[dict]:
             break
     return events
 
-# ---------------------------------------------------------------------
-# Масив для ініціалізації/обходу у твоєму app.py
-# ---------------------------------------------------------------------
 ALL_EXCHANGES: List[Tuple[str, str]] = []
 for ex, (has_spot, has_fut) in SUPPORTED.items():
     if has_spot:
@@ -541,11 +438,6 @@ for ex, (has_spot, has_fut) in SUPPORTED.items():
         ALL_EXCHANGES.append((ex, "futures"))
 
 def api_seed_all() -> Dict[Tuple[str, str], Dict[str, str]]:
-    """
-    Зручно викликати при старті бота:
-      - повертає знімки для всіх доступних (exchange, market)
-      - у лог пише кількість
-    """
     out: Dict[Tuple[str, str], Dict[str, str]] = {}
     for ex, mk in ALL_EXCHANGES:
         snap = api_fetch_snapshot(ex, mk)
