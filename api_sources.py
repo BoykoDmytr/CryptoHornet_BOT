@@ -216,9 +216,13 @@ def _bitget_futures() -> Dict[str, str]:
 
 # ------------------ MEXC ------------------
 def _mexc_spot() -> Dict[str, str]:
+    """
+    Основний: /api/v3/exchangeInfo
+    Фолбек:   /api/v3/ticker/price  (будуємо пари з символів)
+    """
     out: Dict[str, str] = {}
 
-    def add_pair(base: str, quote: str):
+    def _add(base: str, quote: str):
         base, quote = (base or "").upper(), (quote or "").upper()
         if not base or not quote:
             return
@@ -226,7 +230,7 @@ def _mexc_spot() -> Dict[str, str]:
             return
         out[f"{base}/{quote}"] = f"https://www.mexc.com/exchange/{base}_{quote}"
 
-    # primary: v3
+    # primary: v3/exchangeInfo
     try:
         j = _get_json("https://api.mexc.com/api/v3/exchangeInfo")
         symbols = j.get("symbols", []) if isinstance(j, dict) else []
@@ -238,29 +242,39 @@ def _mexc_spot() -> Dict[str, str]:
                 status = (it.get("status") or it.get("state") or "").upper()
                 if status and status not in ok_status:
                     continue
-                add_pair(base, quote)
+                _add(base, quote)
     except Exception as e:
         log.warning("mexc spot v3 error: %s", e)
 
-    # fallback: v2 (деякі регіони/мережі віддають тільки його)
+    # fallback: v3/ticker/price (повертає масив символів типу BTCUSDT)
     if not out:
         try:
-            j2 = _get_json("https://www.mexc.com/open/api/v2/market/symbols")
-            data = j2.get("data") or []
-            for it in data:
-                # приклади полів: symbol, state, baseCurrency, quoteCurrency
-                base = it.get("baseCurrency") or it.get("base") or ""
-                quote = it.get("quoteCurrency") or it.get("quote") or ""
-                state = (it.get("state") or "").upper()
-                if state and state not in ("ENABLED", "TRADING"):
+            j2 = _get_json("https://api.mexc.com/api/v3/ticker/price")
+            arr = j2 if isinstance(j2, list) else (j2.get("data") or j2.get("symbols") or [])
+            for it in arr:
+                sym = (it.get("symbol") if isinstance(it, dict) else it) or ""
+                sym = str(sym).upper()
+                if not sym:
                     continue
-                add_pair(base, quote)
+
+                base, quote = None, None
+                if sym.endswith("USDT"):
+                    base, quote = sym[:-4], "USDT"
+                elif not ONLY_USDT:
+                    # спробуємо інші типові коти, якщо не фільтруємо тільки USDT
+                    for q in ("USDC", "BTC", "ETH", "MX", "TRY", "BRL", "EUR", "GBP", "RUB", "UAH"):
+                        if sym.endswith(q):
+                            base, quote = sym[:-len(q)], q
+                            break
+                if base and quote:
+                    _add(base, quote)
         except Exception as e:
-            log.warning("mexc spot v2 error: %s", e)
+            log.warning("mexc spot ticker fallback error: %s", e)
 
     if not out:
-        log.info("mexc/spot: 0 symbols (both v3 & v2 empty). Можливе блокування IP або тимчасова відмова API.")
+        log.info("mexc/spot: 0 symbols (v3 exchangeInfo і ticker/price порожньо/заблоковано)")
     return out
+
 
 
 
@@ -301,43 +315,56 @@ def _bingx_headers() -> dict:
     return {"X-BX-APIKEY": api_key} if api_key else {}
 
 def _bingx_spot() -> Dict[str, str]:
-    url = "https://open-api.bingx.com/openApi/spot/v1/common/symbols"
-    j = _get_json(url, headers=_bingx_headers())
-
-    # Деякі відповіді приходять як рядок або “оголений” масив
-    if isinstance(j, str):
-        j = _parse_json_text(j)
-
-    data = None
-    # нормальний success-обʼєкт
-    if isinstance(j, dict) and "data" in j:
-        code = j.get("code")
-        if code not in (0, "0", None):
-            log.warning("bingx/spot: non-success code=%s msg=%s", code, j.get("msg"))
-            return {}
-        data = j.get("data") or []
-    # інколи віддають одразу масив
-    elif isinstance(j, list):
-        data = j
-    else:
-        log.warning("bingx/spot: unexpected payload type=%s", type(j).__name__)
-        return {}
-
+    """
+    Основний хост:   https://open-api.bingx.com
+    Альтернативний:  https://api-swap-rest.bingx.com
+    БЕЗ BINGX_API_KEY часто повертає code != 0 (порожньо).
+    """
+    hosts = [
+        "https://open-api.bingx.com",
+        "https://api-swap-rest.bingx.com",
+    ]
     out: Dict[str, str] = {}
-    for it in data:
-        if not isinstance(it, dict):
-            continue
-        base = (it.get("baseAsset") or "").upper()
-        quote = (it.get("quoteAsset") or "").upper()
-        if not base or not quote:
-            continue
-        if ONLY_USDT and quote != "USDT":
-            continue
-        out[f"{base}/{quote}"] = f"https://bingx.com/en-us/spot/{base}_{quote}"
+
+    for host in hosts:
+        try:
+            j = _get_json(f"{host}/openApi/spot/v1/common/symbols", headers=_bingx_headers())
+            if isinstance(j, str):
+                j = _parse_json_text(j)
+
+            data = None
+            if isinstance(j, dict):
+                code = j.get("code")
+                if code not in (0, "0", None):
+                    log.warning("bingx/spot(%s): non-success code=%s msg=%s", host, code, j.get("msg"))
+                    continue
+                data = j.get("data") or []
+            elif isinstance(j, list):
+                data = j
+            else:
+                log.warning("bingx/spot(%s): unexpected payload type=%s", host, type(j).__name__)
+                continue
+
+            for it in data:
+                if not isinstance(it, dict):
+                    continue
+                base = (it.get("baseAsset") or "").upper()
+                quote = (it.get("quoteAsset") or "").upper()
+                if not base or not quote:
+                    continue
+                if ONLY_USDT and quote != "USDT":
+                    continue
+                out[f"{base}/{quote}"] = f"https://bingx.com/en-us/spot/{base}_{quote}"
+
+            if out:
+                return out
+        except Exception as e:
+            log.warning("bingx/spot host %s error: %s", host, e)
 
     if not out:
-        log.info("bingx/spot: 0 symbols (ймовірно потрібен BINGX_API_KEY або IP-ліміт).")
+        log.info("bingx/spot: 0 symbols (ймовірно потрібен BINGX_API_KEY або хости обмежені по IP)")
     return out
+
 
 
 
