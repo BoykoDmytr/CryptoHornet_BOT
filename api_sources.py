@@ -11,6 +11,19 @@ import datetime as _dt
 import pytz as _pytz
 import requests
 
+
+# --- optional time fallback from announcements (only for time) ---
+try:
+    from ann_sources import (
+        mexc_futures_latest,
+        bitget_spot_latest, bitget_futures_latest,
+        gate_spot_latest, gate_futures_latest,
+        bingx_spot_latest, bingx_futures_latest,
+        okx_latest, binance_latest,
+    )
+    _HAS_ANN = True
+except Exception:
+    _HAS_ANN = False
 log = logging.getLogger("hornet.api")
 
 # Таймзони для довідки/логів (видруковуємо "detected:")
@@ -45,6 +58,58 @@ SESSION.headers.update({
 HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
 HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
 PROXIES = {"http": HTTP_PROXY, "https": HTTPS_PROXY} if (HTTP_PROXY or HTTPS_PROXY) else None
+
+def _ann_time_fallback(exchange: str, market: str, base: str, quote: str) -> tuple[Optional[str], Optional[int]]:
+    """
+    Легкий фолбек: йдемо в оголошення, дістаємо ТІЛЬКИ час.
+    Повертає (start_text, start_ts_ms) або (None, None).
+    """
+    if not _HAS_ANN or os.getenv("ANN_TIME_FALLBACK", "1") not in ("1", "true", "True"):
+        return None, None
+
+    ex, mk = exchange.lower(), market.lower()
+    B, Q = base.upper(), quote.upper()
+
+    # вибір колектора
+    funcs = []
+    if ex == "mexc" and mk == "futures":
+        funcs = [mexc_futures_latest]
+    elif ex == "bitget":
+        funcs = [bitget_futures_latest] if mk == "futures" else [bitget_spot_latest]
+    elif ex == "gate":
+        funcs = [gate_futures_latest] if mk == "futures" else [gate_spot_latest]
+    elif ex == "bingx":
+        funcs = [bingx_futures_latest] if mk == "futures" else [bingx_spot_latest]
+    elif ex == "okx":
+        funcs = [okx_latest]
+    elif ex == "binance":
+        funcs = [binance_latest]
+    else:
+        funcs = []
+
+    for f in funcs:
+        try:
+            items = f() or []
+        except Exception:
+            continue
+        # шукаємо збіг по символу в останніх 15–20 постах
+        for it in items[:20]:
+            syms = [s.upper() for s in (it.get("symbols") or [])]
+            if B in syms or f"{B}{Q}" in syms:
+                # якщо є dt — приводимо до TZ біржі та з лейблом
+                dt = it.get("start_dt")
+                if dt is not None:
+                    tz = EXCHANGE_TZ.get(ex, _pytz.utc)
+                    dt_ex = dt.astimezone(tz)
+                    label = _fmt_tzlabel(dt_ex)
+                    txt = dt_ex.strftime("%Y-%m-%d %H:%M ") + label
+                    return txt, int(dt_ex.timestamp() * 1000)
+                # якщо немає dt, але є готовий текст — віддамо його як є
+                stxt = it.get("start_text")
+                if stxt:
+                    return stxt, None
+    return None, None
+
 
 def _parse_json_text(text: str):
     try:
@@ -275,7 +340,10 @@ def api_lookup_listing_time(exchange: str, market: str, base: str, quote: str) -
                 if s in tgt:
                     ts = _pick_ts_ms(it, "listingTime", "launchTime", "onlineTime", "createTime")
                     if ts: return _fmt_ts_for_exchange(ts, ex), ts
-            return None, None
+            st, ts = _ann_time_fallback(ex, mk, B, Q)
+            if st:
+                return st, ts
+            
 
     except Exception:
         # тихо віддаємо «без часу»
@@ -637,9 +705,11 @@ def api_build_events_from_diff(
 def api_preview(exchange: str, market: str, limit: int = 5) -> List[dict]:
     snap = api_fetch_snapshot(exchange, market)
     events = []
-    i = 0
-    for pair, url in snap.items():
+    for i, (pair, url) in enumerate(snap.items()):
+        if i >= max(1, int(limit)):
+            break
         base, quote = (pair.split("/", 1) + [""])[:2]
+        start_text, start_ts = api_lookup_listing_time(exchange, market, base, quote)
         events.append({
             "exchange": exchange.lower(),
             "market": market.lower(),
@@ -648,13 +718,12 @@ def api_preview(exchange: str, market: str, limit: int = 5) -> List[dict]:
             "quote": quote,
             "url": url,
             "title": "тестова пара (API preview)",
-            "start_text": None,  # прев’ю — без часу
+            "start_text": start_text,   # тепер тут буде час, якщо змогли дістати
             "start_dt": None,
+            "start_ts": start_ts,
         })
-        i += 1
-        if i >= max(1, int(limit)):
-            break
     return events
+
 
 ALL_EXCHANGES: List[Tuple[str, str]] = []
 for ex, (has_spot, has_fut) in SUPPORTED.items():
