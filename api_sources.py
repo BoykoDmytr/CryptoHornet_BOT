@@ -109,110 +109,146 @@ SUPPORTED: Dict[str, Tuple[bool, bool]] = {
 def api_lookup_listing_time(exchange: str, market: str, base: str, quote: str) -> tuple[Optional[str], Optional[int]]:
     """
     Повертає (start_text, start_ts_ms) якщо біржа дає час лістингу у своєму API.
-    Якщо немає — (None, None). НІЧОГО не конвертуємо; показуємо у ТЗ біржі.
+    Якщо немає — (None, None). НІЧОГО не конвертуємо у «Київ»; показуємо у ТЗ біржі.
     """
+
+    def _to_ts_ms(v) -> Optional[int]:
+        """Підтримує int секунд/мс та ISO-рядки типу '2024-09-01T12:00:00Z'."""
+        if v is None:
+            return None
+        try:
+            # ISO?
+            if isinstance(v, str):
+                s = v.strip()
+                if s.endswith("Z") or "T" in s or "+" in s or ":" in s:
+                    try:
+                        dt = _dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+                        return int(dt.timestamp() * 1000)
+                    except Exception:
+                        pass
+                # число рядком
+                v = int(float(s))
+            # int/float
+            v = int(v)
+            return v * 1000 if v < 10**12 else v
+        except Exception:
+            return None
+
+    def _pick_ts_ms(obj: dict, *keys) -> Optional[int]:
+        for k in keys:
+            if k in obj and obj[k] is not None:
+                ts = _to_ts_ms(obj[k])
+                if ts:
+                    return ts
+        return None
+
     ex = (exchange or "").lower()
     mk = (market or "").lower()
-    base = (base or "").upper()
-    quote = (quote or "").upper()
+    B, Q = (base or "").upper(), (quote or "").upper()
+
     try:
-        # BINANCE
+        # ---------- BINANCE ----------
         if ex == "binance":
             if mk == "spot":
-                j = _get_json("https://api.binance.com/api/v3/exchangeInfo", params={"symbol": f"{base}{quote}"})
+                j = _get_json("https://api.binance.com/api/v3/exchangeInfo", params={"symbol": f"{B}{Q}"})
                 syms = j.get("symbols", [])
                 if syms:
-                    onboard = syms[0].get("onboardDate")
-                    if onboard:
-                        return _fmt_ts_for_exchange(int(onboard), ex), int(onboard)
+                    ts = _pick_ts_ms(syms[0], "onboardDate", "onboardTs", "listTime", "launchTime")
+                    if ts: return _fmt_ts_for_exchange(ts, ex), ts
             else:
-                j = _get_json("https://fapi.binance.com/fapi/v1/exchangeInfo", params={"symbol": f"{base}{quote}"})
+                j = _get_json("https://fapi.binance.com/fapi/v1/exchangeInfo", params={"symbol": f"{B}{Q}"})
                 syms = j.get("symbols", [])
                 if syms:
-                    onboard = syms[0].get("onboardDate") or syms[0].get("onboardTs")
-                    if onboard:
-                        return _fmt_ts_for_exchange(int(onboard), ex), int(onboard)
+                    ts = _pick_ts_ms(syms[0], "onboardDate", "onboardTs", "listTime", "launchTime")
+                    if ts: return _fmt_ts_for_exchange(ts, ex), ts
             return None, None
 
-        # OKX
+        # ---------- OKX ----------
         if ex == "okx":
             if mk == "spot":
                 j = _get_json("https://www.okx.com/api/v5/public/instruments",
-                              params={"instType": "SPOT", "instId": f"{base}-{quote}"})
+                              params={"instType": "SPOT", "instId": f"{B}-{Q}"})
             else:
                 j = _get_json("https://www.okx.com/api/v5/public/instruments",
-                              params={"instType": "SWAP", "instId": f"{base}-{quote}-SWAP"})
+                              params={"instType": "SWAP", "instId": f"{B}-{Q}-SWAP"})
             data = (j or {}).get("data") or []
             if data:
                 it = data[0]
-                ts = it.get("listTime") or it.get("listTs") or it.get("launchTime")
-                if ts:
-                    ts = int(ts)
-                    return _fmt_ts_for_exchange(ts, ex), ts
+                ts = _pick_ts_ms(it, "listTime", "listTs", "launchTime", "onlineTime")
+                if ts: return _fmt_ts_for_exchange(ts, ex), ts
             return None, None
 
-        # GATE (futures деталь)
+        # ---------- GATE (час є для futures per-symbol) ----------
         if ex == "gate" and mk == "futures":
-            j = _get_json(f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{base}_{quote}")
-            for key in ("launch_time", "inited_at", "create_time", "start_time", "listing_time"):
-                v = j.get(key)
-                if v:
-                    v = int(v)
-                    ts_ms = v if v >= 10**12 else v * 1000
-                    return _fmt_ts_for_exchange(ts_ms, ex), ts_ms
+            # точковий ендпоїнт по контракту
+            j = _get_json(f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{B}_{Q}")
+            # можливі ключі часу у Gate:
+            ts = _pick_ts_ms(
+                j,
+                "launch_time", "inited_at", "init_time",
+                "create_time", "start_time", "listing_time", "first_open_time"
+            )
+            if ts: return _fmt_ts_for_exchange(ts, ex), ts
+            return None, None
+        # Gate spot не дає часу
+        if ex == "gate":
             return None, None
 
-        # BITGET
+        # ---------- BITGET ----------
         if ex == "bitget":
             if mk == "spot":
                 j = _get_json("https://api.bitget.com/api/spot/v1/public/products")
                 for it in j.get("data", []) or []:
-                    if (it.get("baseCoin") or "").upper() == base and (it.get("quoteCoin") or "").upper() == quote:
-                        ts = it.get("listTime") or it.get("onlineTime")
-                        if ts:
-                            ts = int(ts)
-                            return _fmt_ts_for_exchange(ts, ex), ts
+                    if (it.get("baseCoin") or "").upper() == B and (it.get("quoteCoin") or "").upper() == Q:
+                        ts = _pick_ts_ms(it, "listTime", "onlineTime", "launchTime")
+                        if ts: return _fmt_ts_for_exchange(ts, ex), ts
                 return None, None
             else:
                 j = _get_json("https://api.bitget.com/api/mix/v1/market/contracts", params={"productType": "umcbl"})
-                target = f"{base}{quote}_UMCBL"
+                target = f"{B}{Q}_UMCBL"
                 for it in j.get("data", []) or []:
                     if (it.get("symbol") or "").upper() == target:
-                        ts = it.get("listTime") or it.get("launchTime") or it.get("onLineTime")
-                        if ts:
-                            ts = int(ts)
-                            return _fmt_ts_for_exchange(ts, ex), ts
+                        ts = _pick_ts_ms(it, "listTime", "launchTime", "onLineTime", "onlineTime")
+                        if ts: return _fmt_ts_for_exchange(ts, ex), ts
                 return None, None
 
-        # MEXC (тільки futures)
+        # ---------- MEXC (futures, per-symbol detail ПРІОРИТЕТНО) ----------
         if ex == "mexc" and mk == "futures":
-            for url in (
-                "https://contract.mexc.com/api/v1/contract/detail",
-                "https://contract.mexc.com/api/v1/contract/list",
-            ):
+            # 1) спробувати точковий detail із параметром symbol=BASE_USDT (найстабільніше)
+            for sym in (f"{B}_{Q}", f"{B}{Q}"):
+                try:
+                    j = _get_json("https://contract.mexc.com/api/v1/contract/detail", params={"symbol": sym})
+                    data = j.get("data")
+                    if isinstance(data, dict):
+                        ts = _pick_ts_ms(
+                            data,
+                            "onlineTime", "onLineTime", "stateTime", "startTime", "launchTime", "listingTime", "initTime"
+                        )
+                        if ts: return _fmt_ts_for_exchange(ts, ex), ts
+                except Exception:
+                    pass
+            # 2) фолбек: загальні списки
+            for url in ("https://contract.mexc.com/api/v1/contract/detail",
+                        "https://contract.mexc.com/api/v1/contract/list"):
                 try:
                     j = _get_json(url)
+                    data = j.get("data", j.get("result", []))
+                    if isinstance(data, dict):
+                        data = data.get("symbols") or data.get("list") or []
+                    tgt = {f"{B}_{Q}", f"{B}{Q}"}
+                    for it in data or []:
+                        s = str(it.get("symbol") or it.get("instrument_id") or it.get("contractId") or "").upper()
+                        if s in tgt:
+                            ts = _pick_ts_ms(
+                                it,
+                                "onlineTime", "onLineTime", "stateTime", "startTime", "launchTime", "listingTime", "initTime"
+                            )
+                            if ts: return _fmt_ts_for_exchange(ts, ex), ts
                 except Exception:
                     continue
-                data = j.get("data", j.get("result", []))
-                if isinstance(data, dict):
-                    data = data.get("symbols") or data.get("list") or []
-                target1 = f"{base}_{quote}"
-                target2 = f"{base}{quote}"
-                for it in data or []:
-                    sym = (it.get("symbol") or it.get("instrument_id") or it.get("contractId") or "")
-                    s = str(sym).upper()
-                    if s not in (target1, target2):
-                        continue
-                    for key in ("onlineTime", "stateTime", "startTime", "launchTime", "listingTime"):
-                        v = it.get(key)
-                        if v:
-                            v = int(v)
-                            ts_ms = v if v >= 10**12 else v * 1000
-                            return _fmt_ts_for_exchange(ts_ms, ex), ts_ms
             return None, None
 
-        # BYBIT
+        # ---------- BYBIT ----------
         if ex == "bybit":
             cat = "spot" if mk == "spot" else "linear"
             j = _get_json("https://api.bybit.com/v5/market/instruments-info", params={"category": cat})
@@ -224,37 +260,29 @@ def api_lookup_listing_time(exchange: str, market: str, base: str, quote: str) -
                 else:
                     seq.append(item)
             for it in seq:
-                if (it.get("symbol") or "").upper() == f"{base}{quote}":
-                    for key in ("launchTime", "listTime", "createdTime"):
-                        v = it.get(key)
-                        if v:
-                            v = int(v)
-                            ts_ms = v if v >= 10**12 else v * 1000
-                            return _fmt_ts_for_exchange(ts_ms, ex), ts_ms
+                if (it.get("symbol") or "").upper() == f"{B}{Q}":
+                    ts = _pick_ts_ms(it, "launchTime", "listTime", "createdTime", "onlineTime")
+                    if ts: return _fmt_ts_for_exchange(ts, ex), ts
             return None, None
 
-        # BINGX (futures)
+        # ---------- BINGX (futures): публічний контракт-лист часто БЕЗ часу ----------
         if ex == "bingx" and mk == "futures":
             j = _get_json("https://open-api.bingx.com/openApi/swap/v2/quote/contracts")
             data = (j.get("data") or {}).get("contracts") or j.get("data") or []
-            target1 = f"{base}-{quote}".upper()
-            target2 = f"{base}{quote}".upper()
-            for it in data:
+            tgt = {f"{B}-{Q}", f"{B}{Q}"}
+            for it in data or []:
                 s = (it.get("symbol") or it.get("contractName") or "").upper()
-                if s not in (target1, target2):
-                    continue
-                for key in ("listingTime", "launchTime", "onlineTime", "createTime"):
-                    v = it.get(key)
-                    if v:
-                        v = int(v)
-                        ts_ms = v if v >= 10**12 else v * 1000
-                        return _fmt_ts_for_exchange(ts_ms, ex), ts_ms
+                if s in tgt:
+                    ts = _pick_ts_ms(it, "listingTime", "launchTime", "onlineTime", "createTime")
+                    if ts: return _fmt_ts_for_exchange(ts, ex), ts
             return None, None
 
     except Exception:
+        # тихо віддаємо «без часу»
         return None, None
 
     return None, None
+
 
 # =======================
 #   СПИСКИ ПАР (API)
