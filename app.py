@@ -397,7 +397,7 @@ async def main():
             _save_state(state)
 
     # Фонові цикли
-    app.job_queue.run_repeating(lambda *_: None, interval=3600, first=0)  # dummy, щоб job_queue існував
+    #app.job_queue.run_repeating(lambda *_: None, interval=3600, first=0)  # dummy, щоб job_queue існував
     asyncio.create_task(api_pairs_loop(app))
     asyncio.create_task(ann_enrich_loop(app))
 
