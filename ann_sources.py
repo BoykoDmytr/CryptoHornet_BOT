@@ -1,4 +1,4 @@
-# ann_sources.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import os
@@ -32,7 +32,6 @@ HEADERS = {
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
     "Upgrade-Insecure-Requests": "1",
-    # “хромові” заголовки — часто допомагають на MEXC/Gate
     "Sec-Ch-Ua": '"Chromium";v="126", "Not.A/Brand";v="24", "Google Chrome";v="126"',
     "Sec-Ch-Ua-Mobile": "?0",
     "Sec-Fetch-Site": "none",
@@ -49,10 +48,8 @@ HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
 HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
 PROXIES = {"http": HTTP_PROXY, "https": HTTPS_PROXY} if (HTTP_PROXY or HTTPS_PROXY) else None
 
-# Приклад: "https://<your-worker>.workers.dev?url=" або "https://.../fetch?url=" або "https://.../proxy/"
 SCRAPER_URL = (os.getenv("SCRAPER_URL", "") or "").rstrip("/")
 
-# локальні/мовні кукі (інколи прибирають 403)
 try:
     SESSION.cookies.set("locale", os.getenv("MEXC_LOCALE", "en-US"), domain=".mexc.com")
     SESSION.cookies.set("lang", "en_US", domain=".gate.io")
@@ -60,15 +57,7 @@ try:
 except Exception:
     pass
 
-
 def _wrap_scraper_target(q: str) -> str:
-    """
-    Гнучко формуємо URL до зовнішнього скрейпера:
-    - якщо SCRAPER_URL містить '{url}' -> підставляємо
-    - якщо закінчується '=' -> просто додаємо закодований q
-    - якщо вже є '?', але нема '=' в кінці -> додаємо '&url=' + q
-    - інакше -> '?url=' + q
-    """
     if not SCRAPER_URL:
         return q
     if "{url}" in SCRAPER_URL:
@@ -79,17 +68,13 @@ def _wrap_scraper_target(q: str) -> str:
         return SCRAPER_URL + "&url=" + quote(q, safe="")
     return SCRAPER_URL + "?url=" + quote(q, safe="")
 
-
 def _fetch(url: str, params: Dict[str, Any] | None = None):
-    # 1) прямий запит звичайним requests
     try:
         r = SESSION.get(url, params=params, timeout=25, allow_redirects=True, proxies=PROXIES)
         r.raise_for_status()
         return r
     except requests.HTTPError as e:
         code = getattr(e.response, "status_code", None)
-
-        # 2) якщо 403/503 — пробуємо TLS-імперсонацію реального Chrome
         if code in (403, 503) and HAS_CURL:
             for imp in ("chrome124", "chrome120", "chrome110"):
                 try:
@@ -107,8 +92,6 @@ def _fetch(url: str, params: Dict[str, Any] | None = None):
                     r2.raise_for_status()
                 except Exception:
                     continue
-
-        # 3) останній шанс — зовнішній скрейпер (якщо заданий)
         if code in (403, 503) and SCRAPER_URL:
             q = url
             if params:
@@ -117,19 +100,15 @@ def _fetch(url: str, params: Dict[str, Any] | None = None):
             r3 = SESSION.get(final, timeout=25, allow_redirects=True)
             r3.raise_for_status()
             return r3
-
-        raise  # повертаємо початкову помилку
-
+        raise
 
 def get_html(url: str, params: Dict[str, Any] | None = None) -> str:
     return _fetch(url, params=params).text
 
-
-# ---------- загальні утиліти --------------------------------------------------
+# ---------- УТИЛІТИ -----------------------------------------------------------
 
 UA_TZ = pytz.timezone("Europe/Kyiv")
 
-# 2 шаблони часу: "час → дата" та "дата → час" (OKX), враховує UTC/GMT
 RE_TIME_FIRST = re.compile(
     r"(?P<h>\d{1,2}):(?P<m>\d{2})\s*(?P<tz>UTC|GMT)?\s*,?\s*"
     r"(?P<d>\d{1,2})\s+(?P<mon>[A-Za-zА-Яа-яІіЄєЇї]+)\s+(?P<y>\d{4})",
@@ -142,20 +121,15 @@ RE_DATE_FIRST = re.compile(
 )
 
 MONTHS = {
-    # uk
     "січня": 1, "лютого": 2, "березня": 3, "квітня": 4, "травня": 5, "червня": 6,
     "липня": 7, "серпня": 8, "вересня": 9, "жовтня": 10, "листопада": 11, "грудня": 12,
-    # ru
     "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
     "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
-    # en
     "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
     "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
 }
 
-# ширший патерн пар: /, _, -, з/без суфікса -M
 RE_PAIR = re.compile(r"\b([A-Z0-9]{2,})\s*(?:/|_|-)?\s*USDT(?:-M)?\b")
-
 
 def uniq(seq: Iterable[str]) -> List[str]:
     seen, out = set(), []
@@ -164,7 +138,6 @@ def uniq(seq: Iterable[str]) -> List[str]:
             seen.add(x)
             out.append(x)
     return out
-
 
 def extract_symbols(text: str) -> List[str]:
     out = set()
@@ -178,7 +151,6 @@ def extract_symbols(text: str) -> List[str]:
         out.add(sym)
     return sorted(out)
 
-
 def _mk_dt(d: int, mon_name: str, y: int, h: int, m: int, tz_token: Optional[str]):
     mon = MONTHS.get(mon_name.lower())
     if not mon:
@@ -187,7 +159,6 @@ def _mk_dt(d: int, mon_name: str, y: int, h: int, m: int, tz_token: Optional[str
     if tz_token and tz_token.upper() in ("UTC", "GMT"):
         return pytz.utc.localize(naive).astimezone(UA_TZ)
     return UA_TZ.localize(naive)
-
 
 def parse_dt_kiev(text: str) -> Optional[datetime]:
     t = " ".join((text or "").split())
@@ -199,17 +170,13 @@ def parse_dt_kiev(text: str) -> Optional[datetime]:
         return _mk_dt(int(m2["d"]), m2["mon"], int(m2["y"]), int(m2["h"]), int(m2["m"]), m2.group("tz"))
     return None
 
-
-# ----------- display-час як у статті + dt у Києві ----------------------------
-
 RE_TZ_LABEL = re.compile(
-    r"(?P<h>\d{1,2}):(?P<m>\d{2})\s*(?P<label>"
+    r"(?P<t>\d{1,2}:\d{2})\s*(?P<label>"
     r"UTC(?:[+\-]\d{1,2})?|GMT|MSK|MSD|HKT|SGT|KST|JST|CET|CEST|EET|EEST|PST|PDT|EST|EDT"
     r")\b",
     re.I,
 )
 RE_KYIV_LABEL = re.compile(r"(?P<t>\d{1,2}:\d{2})\s*\((?:за|по)\s*києвом\)", re.I)
-
 
 def _valid_hm(t: str) -> bool:
     try:
@@ -236,13 +203,11 @@ def parse_dt_and_display(text: str) -> tuple[Optional[datetime], Optional[str]]:
 
     dt = parse_dt_kiev(t)
     if dt:
-        # якщо в тексті згаданий UTC/GMT — виведемо його, інакше локальний
         if " utc" in t.lower() or " gmt" in t.lower():
             return dt, f"{dt.astimezone(pytz.utc).strftime('%Y-%m-%d %H:%M')} UTC"
         else:
             return dt, dt.strftime("%Y-%m-%d %H:%M")
     return None, None
-
 
 def _dt_from_iso(s: str) -> Optional[datetime]:
     if not s:
@@ -258,9 +223,7 @@ def _dt_from_iso(s: str) -> Optional[datetime]:
     except Exception:
         return None
 
-
 def extract_meta_dt(soup: BeautifulSoup) -> Optional[datetime]:
-    """Пробуємо витягнути дату публікації зі стандартних метаданих/ld+json."""
     cands = []
     for sel in [
         ("meta", {"property": "article:published_time"}),
@@ -298,11 +261,10 @@ def extract_meta_dt(soup: BeautifulSoup) -> Optional[datetime]:
             return dt
     return None
 
-
-# ------ MEXC: лише FUTURES ----------------------------------------------------
-
+# =======================
+#  ДЖЕРЕЛА (колектори)
+# =======================
 def mexc_futures_latest(locale: Optional[str] = None) -> List[Dict[str, Any]]:
-    # Використовуємо тег #Futures, бо new-listings/19 іноді віддає урізаний список
     base = "https://www.mexc.com/announcements/tag/19"
     soup = BeautifulSoup(get_html(base), "html.parser")
     links = []
@@ -325,12 +287,7 @@ def mexc_futures_latest(locale: Optional[str] = None) -> List[Dict[str, Any]]:
                     "start_dt": dt, "start_text": disp, "url": u})
     return out
 
-
-
-# ------ GATE: spot / futures (fallback-и .io/.com і ru/en) --------------------
-
 def gate_collect(market: str) -> List[Dict[str, Any]]:
-    # Спочатку — EN на gate.com (оновлюється швидше), потім gate.io, і лише потім RU
     if market == "spot":
         candidates = [
             ("https://www.gate.com/en/announcements/newlisted", "https://www.gate.com"),
@@ -381,17 +338,11 @@ def gate_collect(market: str) -> List[Dict[str, Any]]:
                     "start_dt": dt, "start_text": disp, "url": u})
     return out
 
-
-
 def gate_spot_latest() -> List[Dict[str, Any]]:
     return gate_collect("spot")
 
-
 def gate_futures_latest() -> List[Dict[str, Any]]:
     return gate_collect("futures")
-
-
-# ------ BINGX: spot / futures -------------------------------------------------
 
 def bingx_collect(section_url: str, market: str) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(get_html(section_url), "html.parser")
@@ -416,16 +367,11 @@ def bingx_collect(section_url: str, market: str) -> List[Dict[str, Any]]:
                     "start_dt": dt, "start_text": disp, "url": u})
     return out
 
-
 def bingx_spot_latest() -> List[Dict[str, Any]]:
     return bingx_collect("https://bingx.com/en/support/notice-center/11257060005007", "spot")
 
-
 def bingx_futures_latest() -> List[Dict[str, Any]]:
     return bingx_collect("https://bingx.com/en/support/notice-center/11257015822991", "futures")
-
-
-# ------ BITGET: spot / futures (EN) -------------------------------------------
 
 def bitget_collect(section_url: str, market: str) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(get_html(section_url), "html.parser")
@@ -450,23 +396,17 @@ def bitget_collect(section_url: str, market: str) -> List[Dict[str, Any]]:
                     "start_dt": dt, "start_text": disp, "url": u})
     return out
 
-
 def bitget_spot_latest() -> List[Dict[str, Any]]:
     return bitget_collect("https://www.bitget.com/en/support/sections/5955813039257", "spot")
 
-
 def bitget_futures_latest() -> List[Dict[str, Any]]:
     return bitget_collect("https://www.bitget.com/en/support/sections/12508313405000", "futures")
-
-
-# ------ OKX: spot + futures (тільки заголовки, що починаються з "Лістинг/Listing") --
 
 def _title_is_listing(title: str) -> bool:
     if not title:
         return False
     t = title.strip().lstrip("[]()【】—-–·* ").lower()
     return t.startswith(("лістинг", "листинг", "listing"))
-
 
 def okx_latest() -> List[Dict[str, Any]]:
     url = "https://www.okx.com/ua/help/section/announcements-new-listings"
@@ -494,9 +434,6 @@ def okx_latest() -> List[Dict[str, Any]]:
         out.append({"exchange": "okx", "market": market, "title": title, "symbols": syms,
                     "start_dt": dt, "start_text": disp, "url": u})
     return out
-
-
-# ------ BINANCE: spot + futures + alpha (CMS API) -----------------------------
 
 def binance_latest(rows: int = 20) -> List[Dict[str, Any]]:
     catalogs = [48, 251, 137]  # 48=new listings, 251=futures, 137=alpha/research
@@ -532,10 +469,14 @@ def binance_latest(rows: int = 20) -> List[Dict[str, Any]]:
             continue
     return out
 
-
-# ------ реєстр джерел (можна вимкнути через ENV=DISABLE_SOURCES) --------------
-
+# =======================
+#  РЕЄСТР + ЕНРІЧЕР
+# =======================
 def sources_matrix() -> List:
+    """
+    Список колекторів для команд типу backfill/preview.
+    MEXC Spot відключено; MEXC Futures залишаємо.
+    """
     disabled = {s.strip().lower() for s in os.getenv("DISABLE_SOURCES", "").split(",") if s.strip()}
     out = []
     if "mexc" not in disabled:
@@ -552,6 +493,84 @@ def sources_matrix() -> List:
         out.append(bitget_spot_latest)
     if "bitget_futures" not in disabled:
         out.append(bitget_futures_latest)
-
     out += [okx_latest, binance_latest]
     return out
+
+def _ann_fetch_for(exchange: str, market: str | None) -> List[Dict[str, Any]]:
+    ex = (exchange or "").lower()
+    mk = (market or "").lower()
+
+    if ex == "gate":
+        if mk == "spot":
+            return gate_spot_latest()
+        if mk == "futures":
+            return gate_futures_latest()
+        return gate_spot_latest() + gate_futures_latest()
+
+    if ex == "mexc":
+        return mexc_futures_latest()
+
+    if ex == "bingx":
+        if mk == "spot":
+            return bingx_spot_latest()
+        if mk == "futures":
+            return bingx_futures_latest()
+        return bingx_spot_latest() + bingx_futures_latest()
+
+    if ex == "bitget":
+        if mk == "spot":
+            return bitget_spot_latest()
+        if mk == "futures":
+            return bitget_futures_latest()
+        return bitget_spot_latest() + bitget_futures_latest()
+
+    if ex == "okx":
+        return okx_latest()
+
+    if ex == "binance":
+        return binance_latest()
+
+    return []
+
+def _looks_like_market(art_market: str, need_market: str) -> bool:
+    if not need_market:
+        return True
+    if art_market == need_market:
+        return True
+    if need_market == "futures" and art_market in ("perpetual", "swap"):
+        return True
+    return False
+
+def ann_lookup_listing_time(exchange: str, market: str, base: str, quote: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Повертає (start_text, source_url, title) з анонсів біржі для вказаної пари.
+    Якщо нічого не знайшли — (None, None, None).
+    """
+    base = (base or "").upper()
+    quote = (quote or "").upper()
+    if not base or not quote:
+        return None, None, None
+
+    arts = _ann_fetch_for(exchange, market)
+    for art in arts:
+        if not isinstance(art, dict):
+            continue
+        if not _looks_like_market(art.get("market") or "", (market or "").lower()):
+            continue
+
+        syms = set(art.get("symbols") or [])
+        title = art.get("title") or ""
+        start_text = art.get("start_text")
+        url = art.get("url")
+
+        if base not in syms and title:
+            syms.update(extract_symbols(title))
+
+        if base in syms:
+            if start_text:
+                return start_text, url, title
+            dt: Optional[datetime] = art.get("start_dt")
+            if dt:
+                return dt.strftime("%Y-%m-%d %H:%M"), url, title
+
+    return None, None, None

@@ -26,9 +26,9 @@ EXCHANGE_TZ = {
     "upbit": _pytz.timezone("Asia/Seoul"),
 }
 
-ONLY_USDT = os.getenv("API_ONLY_USDT", "1") == "1"
+# чи фільтрувати лише USDT-коти
+ONLY_USDT = (os.getenv("API_ONLY_USDT", "1").lower() not in ("0", "false", "no"))
 
-# ------------------ HTTP session ------------------
 SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": (
@@ -42,21 +42,6 @@ SESSION.headers.update({
     "Pragma": "no-cache",
 })
 
-# --- time formatting helpers (показуємо час у ТЗ біржі, як є) ---
-def _fmt_tzlabel(dt: _dt.datetime) -> str:
-    off = dt.utcoffset() or _dt.timedelta(0)
-    hours = int(off.total_seconds() // 3600)
-    return "UTC" if hours == 0 else f"UTC{hours:+d}"
-
-def _fmt_ts_for_exchange(ts_ms: int, exchange: str) -> str:
-    tz = EXCHANGE_TZ.get(exchange.lower(), _pytz.utc)
-    if ts_ms < 10**12:  # сек -> мс
-        ts_ms *= 1000
-    dt = _dt.datetime.fromtimestamp(ts_ms / 1000.0, tz)
-    return dt.strftime("%Y-%m-%d %H:%M ") + _fmt_tzlabel(dt)
-
-# чи фільтрувати лише USDT-коти
-ONLY_USDT = (os.getenv("API_ONLY_USDT", "1").lower() not in ("0", "false", "no"))
 HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
 HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
 PROXIES = {"http": HTTP_PROXY, "https": HTTPS_PROXY} if (HTTP_PROXY or HTTPS_PROXY) else None
@@ -64,7 +49,6 @@ PROXIES = {"http": HTTP_PROXY, "https": HTTPS_PROXY} if (HTTP_PROXY or HTTPS_PRO
 def _parse_json_text(text: str):
     try:
         obj = json.loads(text)
-        # інколи API повертає JSON-рядок всередині JSON-рядка
         for _ in range(2):
             if isinstance(obj, str):
                 obj = json.loads(obj)
@@ -88,10 +72,20 @@ def _get_json(url: str, params: dict | None = None, headers: dict | None = None,
             return _parse_json_text(r.text)
     return _parse_json_text(r.text)
 
-
-
 def _now_utc_text() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+def _fmt_tzlabel(dt: _dt.datetime) -> str:
+    off = dt.utcoffset() or _dt.timedelta(0)
+    hours = int(off.total_seconds() // 3600)
+    return "UTC" if hours == 0 else f"UTC{hours:+d}"
+
+def _fmt_ts_for_exchange(ts_ms: int, exchange: str) -> str:
+    tz = EXCHANGE_TZ.get(exchange.lower(), _pytz.utc)
+    if ts_ms < 10**12:  # sec -> ms
+        ts_ms *= 1000
+    dt = _dt.datetime.fromtimestamp(ts_ms / 1000.0, tz)
+    return dt.strftime("%Y-%m-%d %H:%M ") + _fmt_tzlabel(dt)
 
 def api_now_exchange_iso(exchange: str) -> str:
     tz = EXCHANGE_TZ.get((exchange or "").lower(), _pytz.utc)
@@ -102,23 +96,27 @@ SUPPORTED: Dict[str, Tuple[bool, bool]] = {
     "okx":     (True, True),
     "gate":    (True, True),
     "bitget":  (True, True),
-    "mexc":    (False, True),
+    "mexc":    (False, True),  # MEXC spot вимкнено "на корені"
     "bingx":   (True, True),
     "bybit":   (True, True),
     "bithumb": (True, False),
     "upbit":   (True, False),
 }
 
+# =======================
+#  LOOKUP ЧАСУ (API)
+# =======================
 def api_lookup_listing_time(exchange: str, market: str, base: str, quote: str) -> tuple[Optional[str], Optional[int]]:
     """
     Повертає (start_text, start_ts_ms) якщо біржа дає час лістингу у своєму API.
-    Якщо немає — (None, None). НІЧОГО не конвертуємо в Київ; показуємо у ТЗ біржі.
+    Якщо немає — (None, None). НІЧОГО не конвертуємо; показуємо у ТЗ біржі.
     """
-    ex = exchange.lower()
-    mk = market.lower()
-
+    ex = (exchange or "").lower()
+    mk = (market or "").lower()
+    base = (base or "").upper()
+    quote = (quote or "").upper()
     try:
-        # ---------- BINANCE ----------
+        # BINANCE
         if ex == "binance":
             if mk == "spot":
                 j = _get_json("https://api.binance.com/api/v3/exchangeInfo", params={"symbol": f"{base}{quote}"})
@@ -127,7 +125,7 @@ def api_lookup_listing_time(exchange: str, market: str, base: str, quote: str) -
                     onboard = syms[0].get("onboardDate")
                     if onboard:
                         return _fmt_ts_for_exchange(int(onboard), ex), int(onboard)
-            else:  # futures
+            else:
                 j = _get_json("https://fapi.binance.com/fapi/v1/exchangeInfo", params={"symbol": f"{base}{quote}"})
                 syms = j.get("symbols", [])
                 if syms:
@@ -136,7 +134,7 @@ def api_lookup_listing_time(exchange: str, market: str, base: str, quote: str) -
                         return _fmt_ts_for_exchange(int(onboard), ex), int(onboard)
             return None, None
 
-        # ---------- OKX ----------
+        # OKX
         if ex == "okx":
             if mk == "spot":
                 j = _get_json("https://www.okx.com/api/v5/public/instruments",
@@ -153,29 +151,23 @@ def api_lookup_listing_time(exchange: str, market: str, base: str, quote: str) -
                     return _fmt_ts_for_exchange(ts, ex), ts
             return None, None
 
-        # ---------- GATE ----------
-        if ex == "gate":
-            if mk == "futures":
-                # деталь контракту
-                j = _get_json(f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{base}_{quote}")
-                # шукаємо кандидатні поля часу
-                for key in ("launch_time", "inited_at", "create_time", "start_time", "listing_time"):
-                    v = j.get(key)
-                    if v:
-                        # у Gate часто секунди (int/str)
-                        v = int(v)
-                        ts_ms = v * 1000 if v < 10**12 else v
-                        return _fmt_ts_for_exchange(ts_ms, ex), ts_ms
-            # spot у Gate часу не дає
+        # GATE (futures деталь)
+        if ex == "gate" and mk == "futures":
+            j = _get_json(f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{base}_{quote}")
+            for key in ("launch_time", "inited_at", "create_time", "start_time", "listing_time"):
+                v = j.get(key)
+                if v:
+                    v = int(v)
+                    ts_ms = v if v >= 10**12 else v * 1000
+                    return _fmt_ts_for_exchange(ts_ms, ex), ts_ms
             return None, None
 
-        # ---------- BITGET ----------
+        # BITGET
         if ex == "bitget":
             if mk == "spot":
                 j = _get_json("https://api.bitget.com/api/spot/v1/public/products")
-                for it in j.get("data", []):
+                for it in j.get("data", []) or []:
                     if (it.get("baseCoin") or "").upper() == base and (it.get("quoteCoin") or "").upper() == quote:
-                        # інколи є listTime
                         ts = it.get("listTime") or it.get("onlineTime")
                         if ts:
                             ts = int(ts)
@@ -184,7 +176,7 @@ def api_lookup_listing_time(exchange: str, market: str, base: str, quote: str) -
             else:
                 j = _get_json("https://api.bitget.com/api/mix/v1/market/contracts", params={"productType": "umcbl"})
                 target = f"{base}{quote}_UMCBL"
-                for it in j.get("data", []):
+                for it in j.get("data", []) or []:
                     if (it.get("symbol") or "").upper() == target:
                         ts = it.get("listTime") or it.get("launchTime") or it.get("onLineTime")
                         if ts:
@@ -192,12 +184,11 @@ def api_lookup_listing_time(exchange: str, market: str, base: str, quote: str) -
                             return _fmt_ts_for_exchange(ts, ex), ts
                 return None, None
 
-        # ---------- MEXC (тільки futures) ----------
+        # MEXC (тільки futures)
         if ex == "mexc" and mk == "futures":
-            # спроба через detail
             for url in (
-                f"https://contract.mexc.com/api/v1/contract/detail",
-                f"https://contract.mexc.com/api/v1/contract/list",
+                "https://contract.mexc.com/api/v1/contract/detail",
+                "https://contract.mexc.com/api/v1/contract/list",
             ):
                 try:
                     j = _get_json(url)
@@ -208,28 +199,24 @@ def api_lookup_listing_time(exchange: str, market: str, base: str, quote: str) -
                     data = data.get("symbols") or data.get("list") or []
                 target1 = f"{base}_{quote}"
                 target2 = f"{base}{quote}"
-                # шукаємо контракт
                 for it in data or []:
                     sym = (it.get("symbol") or it.get("instrument_id") or it.get("contractId") or "")
                     s = str(sym).upper()
                     if s not in (target1, target2):
                         continue
-                    # кандидатні поля часу
                     for key in ("onlineTime", "stateTime", "startTime", "launchTime", "listingTime"):
                         v = it.get(key)
                         if v:
                             v = int(v)
                             ts_ms = v if v >= 10**12 else v * 1000
                             return _fmt_ts_for_exchange(ts_ms, ex), ts_ms
-                # якщо не знайшли на цьому URL — пробуємо наступний
             return None, None
 
-        # ---------- BYBIT ----------
+        # BYBIT
         if ex == "bybit":
             cat = "spot" if mk == "spot" else "linear"
             j = _get_json("https://api.bybit.com/v5/market/instruments-info", params={"category": cat})
             lst = (j.get("result") or {}).get("list") or []
-            # в API буває подвійний список
             seq = []
             for item in lst:
                 if isinstance(item, dict) and "list" in item:
@@ -246,7 +233,7 @@ def api_lookup_listing_time(exchange: str, market: str, base: str, quote: str) -
                             return _fmt_ts_for_exchange(ts_ms, ex), ts_ms
             return None, None
 
-        # ---------- BINGX (futures) ----------
+        # BINGX (futures)
         if ex == "bingx" and mk == "futures":
             j = _get_json("https://open-api.bingx.com/openApi/swap/v2/quote/contracts")
             data = (j.get("data") or {}).get("contracts") or j.get("data") or []
@@ -269,9 +256,9 @@ def api_lookup_listing_time(exchange: str, market: str, base: str, quote: str) -
 
     return None, None
 
-
-
-# ------------------ BINANCE ------------------
+# =======================
+#   СПИСКИ ПАР (API)
+# =======================
 def _binance_spot() -> Dict[str, str]:
     j = _get_json("https://api.binance.com/api/v3/exchangeInfo")
     out: Dict[str, str] = {}
@@ -302,7 +289,6 @@ def _binance_futures() -> Dict[str, str]:
         out[f"{base}/{quote}"] = f"https://www.binance.com/en/futures/{base}{quote}"
     return out
 
-# ------------------ OKX ------------------
 def _okx_spot() -> Dict[str, str]:
     j = _get_json("https://www.okx.com/api/v5/public/instruments", params={"instType": "SPOT"})
     out: Dict[str, str] = {}
@@ -332,7 +318,6 @@ def _okx_futures() -> Dict[str, str]:
         out[f"{base}/{quote}"] = f"https://www.okx.com/trade-swap/{base}-{quote}-SWAP"
     return out
 
-# ------------------ GATE ------------------
 def _gate_spot() -> Dict[str, str]:
     j = _get_json("https://api.gateio.ws/api/v4/spot/currency_pairs")
     out: Dict[str, str] = {}
@@ -358,15 +343,13 @@ def _gate_futures() -> Dict[str, str]:
         out[f"{base}/{quote}"] = f"https://www.gate.io/futures_trade/USDT/{base}_{quote}"
     return out
 
-# ------------------ BITGET ------------------
 def _bitget_spot() -> Dict[str, str]:
-    # правильний ендпоїнт: /api/spot/v1/public/products
     j = _get_json("https://api.bitget.com/api/spot/v1/public/products")
     out: Dict[str, str] = {}
     for it in j.get("data", []) or []:
         base = (it.get("baseCoin") or "").upper()
         quote = (it.get("quoteCoin") or "").upper()
-        sym = (it.get("symbol") or "").upper()  # BTCUSDT
+        sym = (it.get("symbol") or "").upper()
         if not base or not quote or not sym:
             continue
         if ONLY_USDT and quote != "USDT":
@@ -375,7 +358,6 @@ def _bitget_spot() -> Dict[str, str]:
     return out
 
 def _bitget_futures() -> Dict[str, str]:
-    # USDT-M perpetuals (productType=umcbl)
     j = _get_json("https://api.bitget.com/api/mix/v1/market/contracts", params={"productType": "umcbl"})
     out: Dict[str, str] = {}
     for it in j.get("data", []) or []:
@@ -388,70 +370,6 @@ def _bitget_futures() -> Dict[str, str]:
             continue
         out[f"{base}/{quote}"] = f"https://www.bitget.com/mix/usdt/{base}{quote}"
     return out
-
-# ------------------ MEXC ------------------
-#def _mexc_spot() -> Dict[str, str]:
-    """
-    Основний: /api/v3/exchangeInfo
-    Фолбек:   /api/v3/ticker/price  (будуємо пари з символів)
-    """
-    out: Dict[str, str] = {}
-
-    def _add(base: str, quote: str):
-        base, quote = (base or "").upper(), (quote or "").upper()
-        if not base or not quote:
-            return
-        if ONLY_USDT and quote != "USDT":
-            return
-        out[f"{base}/{quote}"] = f"https://www.mexc.com/exchange/{base}_{quote}"
-
-    # primary: v3/exchangeInfo
-    try:
-        j = _get_json("https://api.mexc.com/api/v3/exchangeInfo")
-        symbols = j.get("symbols", []) if isinstance(j, dict) else []
-        if symbols:
-            ok_status = {"TRADING", "ENABLED", "PENDING_TRADING", "PRE_TRADING"}
-            for it in symbols:
-                base = it.get("baseAsset")
-                quote = it.get("quoteAsset")
-                status = (it.get("status") or it.get("state") or "").upper()
-                if status and status not in ok_status:
-                    continue
-                _add(base, quote)
-    except Exception as e:
-        log.warning("mexc spot v3 error: %s", e)
-
-    # fallback: v3/ticker/price (повертає масив символів типу BTCUSDT)
-    if not out:
-        try:
-            j2 = _get_json("https://api.mexc.com/api/v3/ticker/price")
-            arr = j2 if isinstance(j2, list) else (j2.get("data") or j2.get("symbols") or [])
-            for it in arr:
-                sym = (it.get("symbol") if isinstance(it, dict) else it) or ""
-                sym = str(sym).upper()
-                if not sym:
-                    continue
-
-                base, quote = None, None
-                if sym.endswith("USDT"):
-                    base, quote = sym[:-4], "USDT"
-                elif not ONLY_USDT:
-                    # спробуємо інші типові коти, якщо не фільтруємо тільки USDT
-                    for q in ("USDC", "BTC", "ETH", "MX", "TRY", "BRL", "EUR", "GBP", "RUB", "UAH"):
-                        if sym.endswith(q):
-                            base, quote = sym[:-len(q)], q
-                            break
-                if base and quote:
-                    _add(base, quote)
-        except Exception as e:
-            log.warning("mexc spot ticker fallback error: %s", e)
-
-    if not out:
-        log.info("mexc/spot: 0 symbols (v3 exchangeInfo і ticker/price порожньо/заблоковано)")
-    return out
-
-
-
 
 def _mexc_futures() -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -468,7 +386,7 @@ def _mexc_futures() -> Dict[str, str]:
                 sym = (it.get("symbol") or it.get("instrument_id") or it.get("contractId") or "")
                 if not sym:
                     continue
-                s = str(sym).upper()  # BTC_USDT або BTCUSDT
+                s = str(sym).upper()
                 if "_" in s:
                     base, quote = s.split("_", 1)[0], s.split("_", 1)[1]
                 elif s.endswith("USDT"):
@@ -484,23 +402,16 @@ def _mexc_futures() -> Dict[str, str]:
             continue
     return out
 
-# ------------------ BINGX ------------------
 def _bingx_headers() -> dict:
     api_key = os.getenv("BINGX_API_KEY", "").strip()
     return {"X-BX-APIKEY": api_key} if api_key else {}
 
 def _bingx_spot() -> Dict[str, str]:
-    """
-    Основний хост:   https://open-api.bingx.com
-    Альтернативний:  https://api-swap-rest.bingx.com
-    БЕЗ BINGX_API_KEY часто повертає code != 0 (порожньо).
-    """
     hosts = [
         "https://open-api.bingx.com",
         "https://api-swap-rest.bingx.com",
     ]
     out: Dict[str, str] = {}
-
     for host in hosts:
         try:
             j = _get_json(f"{host}/openApi/spot/v1/common/symbols", headers=_bingx_headers())
@@ -530,7 +441,6 @@ def _bingx_spot() -> Dict[str, str]:
                 if ONLY_USDT and quote != "USDT":
                     continue
                 out[f"{base}/{quote}"] = f"https://bingx.com/en-us/spot/{base}_{quote}"
-
             if out:
                 return out
         except Exception as e:
@@ -540,16 +450,10 @@ def _bingx_spot() -> Dict[str, str]:
         log.info("bingx/spot: 0 symbols (ймовірно потрібен BINGX_API_KEY або хости обмежені по IP)")
     return out
 
-
-
-
 def _bingx_futures() -> Dict[str, str]:
     j = _get_json("https://open-api.bingx.com/openApi/swap/v2/quote/contracts", headers=_bingx_headers())
     if isinstance(j, str):
         j = _parse_json_text(j)
-
-    # Може бути:
-    # { "data": {"contracts": [...] } } або { "data": [...] } або просто [...]
     data = []
     if isinstance(j, dict):
         data = (j.get("data") or {})
@@ -557,7 +461,6 @@ def _bingx_futures() -> Dict[str, str]:
             data = data.get("contracts") or data.get("list") or []
     elif isinstance(j, list):
         data = j
-
     out: Dict[str, str] = {}
     for it in data or []:
         s = ""
@@ -567,20 +470,19 @@ def _bingx_futures() -> Dict[str, str]:
             s = it.upper()
         if not s:
             continue
-        s = s.replace("-", "")  # BTC-USDT -> BTCUSDT
+        s = s.replace("-", "")
         if ONLY_USDT and not s.endswith("USDT"):
             continue
         base, quote = s[:-4], "USDT"
         out[f"{base}/{quote}"] = f"https://bingx.com/en-us/futures/{base}{quote}"
     return out
 
-# ------------------ BYBIT ------------------
 def _bybit_spot() -> Dict[str, str]:
     j = _get_json("https://api.bybit.com/v5/market/instruments-info", params={"category": "spot"})
     items = j.get("result", {}).get("list", []) or []
     out: Dict[str, str] = {}
     for it in items:
-        sym = (it.get("symbol") or "").upper()  # BTCUSDT
+        sym = (it.get("symbol") or "").upper()
         if not sym:
             continue
         if ONLY_USDT and not sym.endswith("USDT"):
@@ -603,7 +505,6 @@ def _bybit_futures() -> Dict[str, str]:
         out[f"{base}/{quote}"] = f"https://www.bybit.com/en/trade/usdt/{base}USDT"
     return out
 
-# ------------------ BITHUMB (spot) ------------------
 def _bithumb_spot() -> Dict[str, str]:
     try:
         j = _get_json("https://api.bithumb.com/public/ticker/ALL")
@@ -614,18 +515,16 @@ def _bithumb_spot() -> Dict[str, str]:
     for sym, payload in data.items():
         if not isinstance(payload, dict):
             continue
-        # формуємо декілька ринків, USDT залишимо обов'язково
         quotes = ("USDT",) if ONLY_USDT else ("USDT", "KRW", "BTC")
         for quote in quotes:
             out[f"{sym}/{quote}"] = f"https://www.bithumb.com/trade/order/{sym}_{quote}"
     return out
 
-# ------------------ UPBIT (spot) ------------------
 def _upbit_spot() -> Dict[str, str]:
     j = _get_json("https://api.upbit.com/v1/market/all")
     out: Dict[str, str] = {}
     for it in j:
-        market = it.get("market")  # KRW-BTC, USDT-BTC
+        market = it.get("market")
         if not market or "-" not in market:
             continue
         quote, base = market.split("-")[0].upper(), market.split("-")[1].upper()
@@ -634,7 +533,9 @@ def _upbit_spot() -> Dict[str, str]:
         out[f"{base}/{quote}"] = f"https://upbit.com/exchange?code=CRIX.UPBIT.{quote}-{base}"
     return out
 
-# ------------------ API entrypoints ------------------
+# =======================
+#  API entrypoints
+# =======================
 def api_fetch_snapshot(exchange: str, market: str) -> Dict[str, str]:
     ex = exchange.lower().strip()
     mk = market.lower().strip()
@@ -673,7 +574,6 @@ def api_fetch_snapshot(exchange: str, market: str) -> Dict[str, str]:
     except Exception as e:
         log.warning("api %s/%s error: %s", ex, mk, e)
         return {}
-
     return {}
 
 def api_build_events_from_diff(
@@ -684,12 +584,12 @@ def api_build_events_from_diff(
 ) -> List[dict]:
     prev_keys = set(prev_pairs.keys()) if prev_pairs else set()
     events: List[dict] = []
-
     for pair, url in cur_pairs.items():
         if pair in prev_keys:
             continue
         base, quote = (pair.split("/", 1) + [""])[:2]
 
+        # Одразу спробуємо дістати час через API (якщо пощастить)
         start_text, start_ts = api_lookup_listing_time(exchange, market, base, quote)
 
         events.append({
@@ -700,12 +600,11 @@ def api_build_events_from_diff(
             "quote": quote,
             "url": url,
             "title": "нова пара (API)",
-            "start_text": start_text,   # <— якщо None, просто не виведемо рядок
-            "start_dt": None,           # для сумісності з існ. кодом
-            "start_ts": start_ts,       # опційно (не обов’язково)
+            "start_text": start_text,   # якщо None — бот спробує добрати через анонси
+            "start_dt": None,
+            "start_ts": start_ts if start_text else None,
         })
     return events
-
 
 def api_preview(exchange: str, market: str, limit: int = 5) -> List[dict]:
     snap = api_fetch_snapshot(exchange, market)
@@ -721,7 +620,7 @@ def api_preview(exchange: str, market: str, limit: int = 5) -> List[dict]:
             "quote": quote,
             "url": url,
             "title": "тестова пара (API preview)",
-            "start_text": f"detected: {_now_utc_text()}",
+            "start_text": None,  # прев’ю — без часу
             "start_dt": None,
         })
         i += 1
