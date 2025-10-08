@@ -96,20 +96,54 @@ def _display_market(mk: str) -> str:
     return "spot" if mk.lower() == "spot" else "futures"
 
 def _format_event_text(ev: dict) -> str:
-    # Щоб не ловити 400 "can't parse entities", шлемо plain-text без Markdown/HTML.
-    # Формат однаковий для всіх бірж; якщо є start_text — показуємо як на біржі (без конвертацій).
+    """
+    Формує текст повідомлення без Markdown/HTML.
+    Підтримує:
+      - ev["time_candidates"]: список рядків часу (усі знайдені парсером варіанти)
+      - ev["start_text"]: одиничний час (fallback, якщо кандидатів немає)
+    Нічого не конвертуємо — друкуємо «як є» (UTC/UTC+8 тощо).
+    """
     ex = _display_exchange(ev.get("exchange", ""))
     mk = _display_market(ev.get("market", ""))
-    pair = ev.get("pair", "")
+    pair = ev.get("pair") or f"{ev.get('base','')}/{ev.get('quote','')}"
     url = ev.get("url", "")
     title = ev.get("title") or "нова пара (API)"
+
+    # зібрати часи
+    times = ev.get("time_candidates") or []
+    if not times:
+        st = ev.get("start_text")
+        if st:
+            times = [st]
+
+    # унікалізація з збереженням порядку + тримінг
+    seen = set()
+    uniq_times = []
+    for t in times:
+        if not isinstance(t, str):
+            continue
+        t = t.strip()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        uniq_times.append(t)
+
     lines = []
     lines.append(f"✅ {ex} — {mk} {title}")
     lines.append(f"Пара: {pair}")
-    if ev.get("start_text"):
-        lines.append(f"🕒 Старт: {ev['start_text']}")
-    lines.append(f"🔗 Тікер: {url}")
+
+    if len(uniq_times) == 1:
+        lines.append(f"🕒 Старт: {uniq_times[0]}")
+    elif len(uniq_times) > 1:
+        lines.append("🕒 Старт (кандидати):")
+        for t in uniq_times[:6]:  # не більше 6 рядків, щоб не роздувати пост
+            lines.append(f"• {t}")
+
+    if url:
+        lines.append(f"🔗 Тікер: {url}")
+
     return "\n".join(lines)
+
 
 async def _post_event(ctx: ContextTypes.DEFAULT_TYPE, ev: dict) -> Optional[int]:
     chat_id = TARGET_CHAT_ID or OWNER_CHAT_ID

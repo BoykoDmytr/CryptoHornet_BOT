@@ -1,4 +1,4 @@
-# ann_sources.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import os
@@ -12,7 +12,7 @@ import pytz
 import requests
 from bs4 import BeautifulSoup
 
-# ---- TLS-імперсонація Chrome (для обходу 403, якщо потрібно) ----
+# ---- TLS-імперсонація Chrome (для обходу 403) ----
 try:
     from curl_cffi import requests as curl_requests
     HAS_CURL = True
@@ -32,7 +32,6 @@ HEADERS = {
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
     "Upgrade-Insecure-Requests": "1",
-    # “хромові” заголовки — інколи допомагають на MEXC/Gate
     "Sec-Ch-Ua": '"Chromium";v="126", "Not.A/Brand";v="24", "Google Chrome";v="126"',
     "Sec-Ch-Ua-Mobile": "?0",
     "Sec-Fetch-Site": "none",
@@ -49,25 +48,18 @@ HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
 HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
 PROXIES = {"http": HTTP_PROXY, "https": HTTPS_PROXY} if (HTTP_PROXY or HTTPS_PROXY) else None
 
-# Приклад: "https://<your-worker>.workers.dev?url=" або "https://.../fetch?url=" або "https://.../proxy/"
 SCRAPER_URL = (os.getenv("SCRAPER_URL", "") or "").rstrip("/")
 
-# локальні/мовні кукі (інколи прибирають 403)
+# локальні/мовні кукі
 try:
-    SESSION.cookies.set("locale", os.getenv("MEXC_LOCALE", "uk-UA"), domain=".mexc.com")
-    SESSION.cookies.set("lang", "ru_RU", domain=".gate.com")
+    SESSION.cookies.set("locale", os.getenv("MEXC_LOCALE", "en-US"), domain=".mexc.com")
+    SESSION.cookies.set("lang", "en_US", domain=".gate.io")
+    SESSION.cookies.set("lang", "en_US", domain=".gate.com")
 except Exception:
     pass
 
 
 def _wrap_scraper_target(q: str) -> str:
-    """
-    Гнучко формуємо URL до зовнішнього скрейпера:
-    - якщо SCRAPER_URL містить '{url}' -> підставляємо
-    - якщо закінчується '=' -> просто додаємо закодований q
-    - якщо вже є '?', але нема '=' в кінці -> додаємо '&url=' + q
-    - інакше -> '?url=' + q
-    """
     if not SCRAPER_URL:
         return q
     if "{url}" in SCRAPER_URL:
@@ -80,7 +72,7 @@ def _wrap_scraper_target(q: str) -> str:
 
 
 def _fetch(url: str, params: Dict[str, Any] | None = None):
-    # 1) прямий запит звичайним requests
+    # 1) прямий запит
     try:
         r = SESSION.get(url, params=params, timeout=25, allow_redirects=True, proxies=PROXIES)
         r.raise_for_status()
@@ -88,7 +80,7 @@ def _fetch(url: str, params: Dict[str, Any] | None = None):
     except requests.HTTPError as e:
         code = getattr(e.response, "status_code", None)
 
-        # 2) якщо 403/503 — пробуємо TLS-імперсонацію реального Chrome
+        # 2) TLS-імперсонація
         if code in (403, 503) and HAS_CURL:
             for imp in ("chrome124", "chrome120", "chrome110"):
                 try:
@@ -107,7 +99,7 @@ def _fetch(url: str, params: Dict[str, Any] | None = None):
                 except Exception:
                     continue
 
-        # 3) останній шанс — зовнішній скрейпер (якщо заданий)
+        # 3) зовнішній скрейпер
         if code in (403, 503) and SCRAPER_URL:
             q = url
             if params:
@@ -117,28 +109,16 @@ def _fetch(url: str, params: Dict[str, Any] | None = None):
             r3.raise_for_status()
             return r3
 
-        raise  # повертаємо початкову помилку
+        raise
 
 
 def get_html(url: str, params: Dict[str, Any] | None = None) -> str:
     return _fetch(url, params=params).text
 
 
-# ---------- загальні утиліти --------------------------------------------------
+# ---------- утиліти ----------------------------------------------------------
 
 UA_TZ = pytz.timezone("Europe/Kyiv")
-
-# 2 шаблони часу: "час → дата" та "дата → час" (OKX), враховує UTC/GMT
-RE_TIME_FIRST = re.compile(
-    r"(?P<h>\d{1,2}):(?P<m>\d{2})\s*(?P<tz>UTC|GMT)?\s*,?\s*"
-    r"(?P<d>\d{1,2})\s+(?P<mon>[A-Za-zА-Яа-яІіЄєЇї]+)\s+(?P<y>\d{4})",
-    re.I,
-)
-RE_DATE_FIRST = re.compile(
-    r"(?P<d>\d{1,2})\s+(?P<mon>[A-Za-zА-Яа-яІіЄєЇї]+)\s+(?P<y>\d{4}).{0,80}?"
-    r"(?P<h>\d{1,2}):(?P<m>\d{2})\s*(?P<tz>UTC|GMT)?",
-    re.I | re.S,
-)
 
 MONTHS = {
     # uk
@@ -152,11 +132,41 @@ MONTHS = {
     "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
 }
 
-# ширший патерн пар: /, _, -, з/без суфікса -M
 RE_PAIR = re.compile(r"\b([A-Z0-9]{2,})\s*(?:/|_|-)?\s*USDT(?:-M)?\b")
 
+# час у форматах:
+# 1) 2025-10-08 06:29:01 UTC+0 / UTC+8 / GMT+8 / (секунди опціональні)
+RE_ISO_TZ = re.compile(
+    r"\b(?P<d>\d{4})[-/.](?P<m>\d{1,2})[-/.](?P<y>\d{1,2})[ T]"
+    r"(?P<h>\d{1,2}):(?P<min>\d{2})(?::(?P<s>\d{2}))?\s*"
+    r"(?P<tz>(?:UTC|GMT)(?:[+\-]\d{1,2})?|UTC[ ]?[+\-]?\d{1,2}|UTC\+0|UTC-0)?\b",
+    re.I,
+)
 
-def uniq(seq: Iterable[str]) -> List[str]:
+# 2) «Открытие|Start|Listing time|Trading starts: YYYY-MM-DD HH:MM(:SS) ...»
+RE_LABELLED = re.compile(
+    r"(?:(Открытие|Старт|Start|Listing\s*Time|Trading\s*(?:Starts|Opens)|Go-?Live)\s*[:\-–]\s*)"
+    r"(?P<date>\d{4}[-/.]\d{1,2}[-/.]\d{1,2})[ T]"
+    r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?)\s*(?P<tz>(?:UTC|GMT)(?:[+\-]\d{1,2})?|UTC[ ]?[+\-]?\d{1,2}|UTC\+0|UTC-0)?",
+    re.I,
+)
+
+# 3) Time-first «15:00 UTC, 8 October 2025»
+RE_TIME_FIRST = re.compile(
+    r"(?P<h>\d{1,2}):(?P<m>\d{2})\s*(?P<tz>UTC|GMT)?\s*,?\s*"
+    r"(?P<d>\d{1,2})\s+(?P<mon>[A-Za-zА-Яа-яІіЄєЇї]+)\s+(?P<y>\d{4})",
+    re.I,
+)
+
+# 4) Date-first «8 October 2025 ... 15:00 UTC»
+RE_DATE_FIRST = re.compile(
+    r"(?P<d>\d{1,2})\s+(?P<mon>[A-Za-zА-Яа-яІіЄєЇї]+)\s+(?P<y>\d{4}).{0,120}?"
+    r"(?P<h>\d{1,2}):(?P<m>\d{2})\s*(?P<tz>UTC|GMT)?",
+    re.I | re.S,
+)
+
+
+def uniq_keep(seq: Iterable[str]) -> List[str]:
     seen, out = set(), []
     for x in seq:
         if x not in seen:
@@ -178,88 +188,68 @@ def extract_symbols(text: str) -> List[str]:
     return sorted(out)
 
 
-def _mk_dt(d: int, mon_name: str, y: int, h: int, m: int, tz_token: Optional[str]):
-    mon = MONTHS.get(mon_name.lower())
-    if not mon:
-        return None
-    naive = datetime(y, mon, d, h, m)
-    if tz_token and tz_token.upper() in ("UTC", "GMT"):
-        return pytz.utc.localize(naive).astimezone(UA_TZ)
-    return UA_TZ.localize(naive)
+def _month_num(name: str) -> Optional[int]:
+    return MONTHS.get(name.lower())
 
 
-def parse_dt_kiev(text: str) -> Optional[datetime]:
+def parse_all_times(text: str) -> List[str]:
+    """
+    Витягає УСІ помічені часи з тексту і повертає масив рядків, як вони мають відображатися.
+    Нічого не конвертуємо в Київ — показуємо "як є".
+    """
     t = " ".join((text or "").split())
-    m = RE_TIME_FIRST.search(t)
-    if m:
-        return _mk_dt(int(m["d"]), m["mon"], int(m["y"]), int(m["h"]), int(m["m"]), m.group("tz"))
-    m2 = RE_DATE_FIRST.search(t)
-    if m2:
-        return _mk_dt(int(m2["d"]), m2["mon"], int(m2["y"]), int(m2["h"]), int(m2["m"]), m2.group("tz"))
-    return None
+    found: List[str] = []
+
+    # 1) ISO + TZ
+    for m in RE_ISO_TZ.finditer(t):
+        dd = f"{m.group('d')}-{int(m.group('m')):02d}-{int(m.group('y')):02d}"
+        tt = f"{int(m.group('h')):02d}:{int(m.group('min')):02d}"
+        if m.group('s'):
+            tt = f"{tt}:{int(m.group('s')):02d}"
+        tz = (m.group('tz') or "").upper().replace("  ", " ").strip()
+        disp = f"{dd} {tt}" + (f" {tz}" if tz else "")
+        found.append(disp)
+
+    # 2) Labelled
+    for m in RE_LABELLED.finditer(t):
+        dd = m.group('date')
+        tt = m.group('time')
+        tz = (m.group('tz') or "").upper().strip()
+        disp = f"{dd} {tt}" + (f" {tz}" if tz else "")
+        found.append(disp)
+
+    # 3) Time-first
+    for m in RE_TIME_FIRST.finditer(t):
+        d = int(m.group('d')); y = int(m.group('y'))
+        mon_n = _month_num(m.group('mon'))
+        if not mon_n:
+            continue
+        tt = f"{int(m.group('h')):02d}:{int(m.group('m')):02d}"
+        tz = (m.group('tz') or "").upper().strip()
+        disp = f"{y}-{mon_n:02d}-{d:02d} {tt}" + (f" {tz}" if tz else "")
+        found.append(disp)
+
+    # 4) Date-first
+    for m in RE_DATE_FIRST.finditer(t):
+        d = int(m.group('d')); y = int(m.group('y'))
+        mon_n = _month_num(m.group('mon'))
+        if not mon_n:
+            continue
+        tt = f"{int(m.group('h')):02d}:{int(m.group('m')):02d}"
+        tz = (m.group('tz') or "").upper().strip()
+        disp = f"{y}-{mon_n:02d}-{d:02d} {tt}" + (f" {tz}" if tz else "")
+        found.append(disp)
+
+    # Нормалізація дрібних варіацій (UTC+0 vs UTC+00:00 ми не торкаємось — показуємо як є)
+    # Але прибираємо дублікати, зберігаючи порядок:
+    return uniq_keep(found)
 
 
-# ----------- display-час як у статті + dt у Києві ----------------------------
-
-RE_TZ_LABEL = re.compile(
-    r"(?P<h>\d{1,2}):(?P<m>\d{2})\s*(?P<label>"
-    r"UTC(?:[+\-]\d{1,2})?|GMT|MSK|MSD|HKT|SGT|KST|JST|CET|CEST|EET|EEST|PST|PDT|EST|EDT"
-    r")\b",
-    re.I,
-)
-RE_KYIV_LABEL = re.compile(r"(?P<t>\d{1,2}:\d{2})\s*\((?:за|по)\s*києвом\)", re.I)
-
-
-def _valid_hm(t: str) -> bool:
-    try:
-        h, m = t.split(":")
-        h = int(h); m = int(m)
-        return 0 <= h < 24 and 0 <= m < 60
-    except Exception:
-        return False
-
-def parse_dt_and_display(text: str) -> tuple[Optional[datetime], Optional[str]]:
-    t = " ".join(text.split())
-
-    m = RE_TZ_LABEL.search(t)
-    if m and _valid_hm(m.group('t')):
-        disp = f"{m.group('t')} {m.group('label').upper()}"
-        dt = parse_dt_kiev(t)
-        return dt, disp
-
-    m2 = RE_KYIV_LABEL.search(t)
-    if m2 and _valid_hm(m2.group('t')):
-        disp = f"{m2.group('t')} (за Києвом)"
-        dt = parse_dt_kiev(t)
-        return dt, disp
-
-    dt = parse_dt_kiev(t)
-    if dt:
-        # якщо в тексті згаданий UTC/GMT — виведемо його, інакше локальний
-        if " utc" in t.lower() or " gmt" in t.lower():
-            return dt, f"{dt.astimezone(pytz.utc).strftime('%Y-%m-%d %H:%M')} UTC"
-        else:
-            return dt, dt.strftime("%Y-%m-%d %H:%M")
-    return None, None
-
-
-def _dt_from_iso(s: str) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        s2 = s.strip()
-        if s2.endswith("Z"):
-            s2 = s2[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s2)
-        if dt.tzinfo is None:
-            dt = pytz.utc.localize(dt)
-        return dt.astimezone(UA_TZ)
-    except Exception:
-        return None
-
-
-def extract_meta_dt(soup: BeautifulSoup) -> Optional[datetime]:
-    """Пробуємо витягнути дату публікації зі стандартних метаданих/ld+json."""
+def extract_meta_dt(soup: BeautifulSoup) -> Optional[str]:
+    """
+    ЧИСТО як додатковий кандидат (не завжди це час старту торгів) — час публікації.
+    Повертаємо дисплей-рядок у UTC (ISO), або None.
+    """
     cands = []
     for sel in [
         ("meta", {"property": "article:published_time"}),
@@ -291,245 +281,162 @@ def extract_meta_dt(soup: BeautifulSoup) -> Optional[datetime]:
         except Exception:
             pass
 
+    # вертаємо перший валідний ISO
     for s in cands:
-        dt = _dt_from_iso(s)
-        if dt:
-            return dt
+        try:
+            s2 = s.strip()
+            if s2.endswith("Z"):
+                s2 = s2[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s2)
+            # показуємо як UTC ISO без перетворень
+            if dt.tzinfo is None:
+                return dt.strftime("%Y-%m-%d %H:%M")
+            return dt.astimezone(pytz.utc).strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            continue
     return None
 
 
-# ---------------- MEXC Futures (тільки цей URL) ------------------------------
+# ---------- Колектори з ЖОРСТКО фіксованих сторінок --------------------------
+# ПАРСИМО ТІЛЬКИ з цих URL (як ти просив):
 
-def mexc_futures_latest(locale: Optional[str] = None) -> List[Dict[str, Any]]:
-    # Тільки з: https://www.mexc.com/uk-UA/announcements/new-listings/19
-    url = "https://www.mexc.com/uk-UA/announcements/new-listings/19"
-    soup = BeautifulSoup(get_html(url), "html.parser")
+URLS = {
+    "mexc_futures": "https://www.mexc.com/uk-UA/announcements/new-listings/19",
+    "gate_spot":    "https://www.gate.com/ru/announcements/newspotlistings",
+    "gate_futures": "https://www.gate.com/ru/announcements/newfutureslistings",
+    "bingx_spot":   "https://bingx.com/en/support/notice-center/11257060005007",
+    "bingx_futures":"https://bingx.com/en/support/notice-center/11257015822991",
+    "bitget_spot":  "https://www.bitget.com/support/sections/5955813039257",
+    "bitget_futures":"https://www.bitget.com/support/sections/12508313405000",
+    "okx_all":      "https://www.okx.com/ua/help/section/announcements-new-listings",
+    "binance_all":  "https://www.binance.com/en/support/announcement/list/48",
+}
+
+
+def _collect_generic(section_url: str, base_domain: str | None = None) -> List[str]:
+    html = get_html(section_url)
+    soup = BeautifulSoup(html, "html.parser")
     links = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if "/announcements/article/" in href:
-            if not href.startswith("http"):
-                href = "https://www.mexc.com" + (href if href.startswith("/") else "/" + href)
+        if any(k in href for k in ("/announcements/", "/support/articles/", "/help/articles/", "/support/announcement")):
+            if base_domain and not href.startswith("http"):
+                href = base_domain + (href if href.startswith("/") else "/" + href)
+            elif not href.startswith("http"):
+                # на деяких сайтах посилання відносні
+                if "bingx.com" in section_url:
+                    href = "https://bingx.com" + (href if href.startswith("/") else "/" + href)
+                elif "bitget.com" in section_url:
+                    href = "https://www.bitget.com" + (href if href.startswith("/") else "/" + href)
+                elif "okx.com" in section_url:
+                    href = "https://www.okx.com" + (href if href.startswith("/") else "/" + href)
+                elif "binance.com" in section_url:
+                    href = "https://www.binance.com" + (href if href.startswith("/") else "/" + href)
             links.append(href)
-    links = uniq(links)[:20]
-
-    out: List[Dict[str, Any]] = []
-    for u in links:
-        s = BeautifulSoup(get_html(u), "html.parser")
-        title = s.find("h1").get_text(" ", strip=True) if s.find("h1") else ""
-        plain = s.get_text(" ", strip=True)
-        syms = extract_symbols(plain)
-        dt, disp = parse_dt_and_display(plain)
-        out.append({"exchange": "mexc", "market": "futures", "title": title, "symbols": syms,
-                    "start_dt": dt, "start_text": disp, "url": u})
-    return out
-
-
-# ---------------- Gate: Spot / Futures (тільки gate.com RU) ------------------
-
-def _gate_collect_ru(market: str) -> List[Dict[str, Any]]:
-    if market == "spot":
-        url = "https://www.gate.com/ru/announcements/newspotlistings"
-    else:
-        url = "https://www.gate.com/ru/announcements/newfutureslistings"
-
-    html = get_html(url)
-    soup = BeautifulSoup(html, "html.parser")
-    arts = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/announcements/detail" in href or "/announcements/article" in href:
-            if not href.startswith("http"):
-                href = "https://www.gate.com" + href
-            arts.append(href)
-    arts = uniq(arts)[:20]
-
+    # трохи усікти шум
+    # (залишаємо перші ~20 для продуктивності)
     out = []
-    for u in arts:
-        s = BeautifulSoup(get_html(u), "html.parser")
-        title = s.find("h1").get_text(" ", strip=True) if s.find("h1") else ""
-        plain = s.get_text(" ", strip=True)
-        syms = extract_symbols(plain)
-        dt, disp = parse_dt_and_display(plain)
-        out.append({"exchange": "gate", "market": market, "title": title, "symbols": syms,
-                    "start_dt": dt, "start_text": disp, "url": u})
+    seen = set()
+    for u in links:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+        if len(out) >= 20:
+            break
     return out
+
+
+def _article_to_record(u: str, exchange: str, market: str) -> Dict[str, Any]:
+    s = BeautifulSoup(get_html(u), "html.parser")
+    title = s.find(["h1", "h2"]).get_text(" ", strip=True) if s.find(["h1", "h2"]) else ""
+    plain = s.get_text(" ", strip=True)
+    syms = extract_symbols(plain)
+    cands = parse_all_times(plain)
+
+    # як fallback — час публікації (може бути корисним як орієнтир)
+    meta_iso = extract_meta_dt(s)
+    if meta_iso and meta_iso not in cands:
+        cands.append(meta_iso)
+
+    return {
+        "exchange": exchange,
+        "market": market,
+        "title": title,
+        "symbols": syms,
+        "time_candidates": cands,           # <— ВСІ знайдені часи
+        "start_text": cands[0] if cands else None,  # перший кандидат
+        "url": u,
+    }
+
+
+def mexc_futures_latest() -> List[Dict[str, Any]]:
+    links = _collect_generic(URLS["mexc_futures"], base_domain="https://www.mexc.com")
+    return [_article_to_record(u, "mexc", "futures") for u in links]
+
 
 def gate_spot_latest() -> List[Dict[str, Any]]:
-    return _gate_collect_ru("spot")
+    links = _collect_generic(URLS["gate_spot"], base_domain="https://www.gate.com")
+    return [_article_to_record(u, "gate", "spot") for u in links]
+
 
 def gate_futures_latest() -> List[Dict[str, Any]]:
-    return _gate_collect_ru("futures")
+    links = _collect_generic(URLS["gate_futures"], base_domain="https://www.gate.com")
+    return [_article_to_record(u, "gate", "futures") for u in links]
 
-
-# ---------------- BingX: Spot / Futures (тільки ці URL) ----------------------
-
-def _bingx_collect(section_url: str, market: str) -> List[Dict[str, Any]]:
-    soup = BeautifulSoup(get_html(section_url), "html.parser")
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/support/announcements/" in href or "/support/notice-center/" in href:
-            if not href.startswith("http"):
-                href = "https://bingx.com" + href
-            links.append(href)
-    links = uniq(links)[:20]
-    out = []
-    for u in links:
-        s = BeautifulSoup(get_html(u), "html.parser")
-        title = s.find(["h1", "h2"]).get_text(" ", strip=True) if s.find(["h1", "h2"]) else ""
-        plain = s.get_text(" ", strip=True)
-        syms = extract_symbols(plain)
-        dt, disp = parse_dt_and_display(plain)
-        if dt is None:
-            dt = extract_meta_dt(s)
-        out.append({"exchange": "bingx", "market": market, "title": title, "symbols": syms,
-                    "start_dt": dt, "start_text": disp, "url": u})
-    return out
 
 def bingx_spot_latest() -> List[Dict[str, Any]]:
-    return _bingx_collect("https://bingx.com/en/support/notice-center/11257060005007", "spot")
+    links = _collect_generic(URLS["bingx_spot"])
+    return [_article_to_record(u, "bingx", "spot") for u in links]
+
 
 def bingx_futures_latest() -> List[Dict[str, Any]]:
-    return _bingx_collect("https://bingx.com/en/support/notice-center/11257015822991", "futures")
+    links = _collect_generic(URLS["bingx_futures"])
+    return [_article_to_record(u, "bingx", "futures") for u in links]
 
-
-# ---------------- Bitget: Spot / Futures (тільки ці URL) ---------------------
-
-def _bitget_collect(section_url: str, market: str) -> List[Dict[str, Any]]:
-    soup = BeautifulSoup(get_html(section_url), "html.parser")
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/support/articles/" in href or "/support/announcements/" in href:
-            if not href.startswith("http"):
-                href = "https://www.bitget.com" + href
-            links.append(href)
-    links = uniq(links)[:20]
-    out = []
-    for u in links:
-        s = BeautifulSoup(get_html(u), "html.parser")
-        title = s.find(["h1", "h2"]).get_text(" ", strip=True) if s.find(["h1", "h2"]) else ""
-        plain = s.get_text(" ", strip=True)
-        syms = extract_symbols(plain)
-        dt, disp = parse_dt_and_display(plain)
-        if dt is None:
-            dt = extract_meta_dt(s)
-        out.append({"exchange": "bitget", "market": market, "title": title, "symbols": syms,
-                    "start_dt": dt, "start_text": disp, "url": u})
-    return out
 
 def bitget_spot_latest() -> List[Dict[str, Any]]:
-    return _bitget_collect("https://www.bitget.com/support/sections/5955813039257", "spot")
+    links = _collect_generic(URLS["bitget_spot"])
+    return [_article_to_record(u, "bitget", "spot") for u in links]
+
 
 def bitget_futures_latest() -> List[Dict[str, Any]]:
-    return _bitget_collect("https://www.bitget.com/support/sections/12508313405000", "futures")
+    links = _collect_generic(URLS["bitget_futures"])
+    return [_article_to_record(u, "bitget", "futures") for u in links]
 
-
-# ---------------- OKX: Spot + Futures (лише ця секція) -----------------------
-
-def _title_is_listing(title: str) -> bool:
-    if not title:
-        return False
-    t = title.strip().lstrip("[]()【】—-–·* ").lower()
-    return t.startswith(("лістинг", "листинг", "listing"))
 
 def okx_latest() -> List[Dict[str, Any]]:
-    url = "https://www.okx.com/ua/help/section/announcements-new-listings"
-    soup = BeautifulSoup(get_html(url), "html.parser")
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/help/articles/" in href or "/help/announcement" in href:
-            if not href.startswith("http"):
-                href = "https://www.okx.com" + href
-            links.append(href)
-    links = uniq(links)[:20]
+    links = _collect_generic(URLS["okx_all"])
     out = []
     for u in links:
-        s = BeautifulSoup(get_html(u), "html.parser")
-        title = s.find(["h1", "h2"]).get_text(" ", strip=True) if s.find(["h1", "h2"]) else ""
-        if not _title_is_listing(title):
-            continue
-        plain = s.get_text(" ", strip=True)
-        syms = extract_symbols(plain)
-        market = "futures" if any(k in plain.lower() for k in ["swap", "perpetual", "ф'ючер", "фьючер"]) else "spot"
-        dt, disp = parse_dt_and_display(plain)
-        if dt is None:
-            dt = extract_meta_dt(s)
-        out.append({"exchange": "okx", "market": market, "title": title, "symbols": syms,
-                    "start_dt": dt, "start_text": disp, "url": u})
+        rec = _article_to_record(u, "okx", "spot")  # дефолт spot
+        # якщо у тексті є ознаки ф’ючерсів — переключаємо
+        txt = (rec["title"] + " " + get_html(u)).lower()
+        if any(k in txt for k in ["swap", "perpetual", "ф'ючер", "фьючер"]):
+            rec["market"] = "futures"
+        out.append(rec)
     return out
 
 
-# ---------------- Binance: Spot (+Futures/Alpha якщо сторінка це містить) ----
-# Вимога: парсити ТІЛЬКИ звідси: https://www.binance.com/en/support/announcement/list/48
-# (це список оголошень, далі переходимо в самі статті й тягнемо час)
+def binance_latest(rows: int = 20) -> List[Dict[str, Any]]:
+    """
+    Через CMS ліст отримуємо id статей, але сам текст і час тягнемо зі сторінок:
+    посилання на список ти дав, тому парсимо так само зі сторінок.
+    """
+    # просто парсимо саму сторінку розділу (у Binance там теж є посилання на статті)
+    links = _collect_generic(URLS["binance_all"])
+    return [_article_to_record(u, "binance", "spot") for u in links]
 
-def binance_latest(rows: int = 30) -> List[Dict[str, Any]]:
-    list_url = "https://www.binance.com/en/support/announcement/list/48"
-    html = get_html(list_url)
-    soup = BeautifulSoup(html, "html.parser")
-
-    # зберемо посилання на окремі анонси
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        # посилання на сторінку анонсу
-        if "/en/support/announcement/" in href:
-            if not href.startswith("http"):
-                href = "https://www.binance.com" + href
-            links.append(href)
-    links = uniq(links)[:rows] if links else []
-
-    out: List[Dict[str, Any]] = []
-    for u in links:
-        s = BeautifulSoup(get_html(u), "html.parser")
-        title = s.find("h1").get_text(" ", strip=True) if s.find("h1") else ""
-        plain = s.get_text(" ", strip=True)
-        syms = extract_symbols(plain)
-        dt, disp = parse_dt_and_display(plain)
-        if dt is None:
-            dt = extract_meta_dt(s)
-
-        # Маркет: цю сторінку ми трактуємо як SPOT-листинги.
-        # Якщо в заголовку/тексті явно згаданий futures/perpetual — позначимо "futures".
-        market = "spot"
-        tl = (title or "").lower()
-        pl = (plain or "").lower()
-        if "futures" in tl or "futures" in pl or "perpetual" in pl:
-            market = "futures"
-        if "alpha" in tl or "alpha" in pl:
-            # за потреби ти відфільтруєш (у основному коді)
-            market = "alpha"
-
-        out.append({
-            "exchange": "binance",
-            "market": market,
-            "title": title,
-            "symbols": syms,
-            "start_dt": dt,
-            "start_text": disp,
-            "url": u
-        })
-    return out
-
-
-# ------ реєстр джерел (парсимо тільки з наданих URL) -------------------------
 
 def sources_matrix() -> List:
-    """
-    Використовується лише якщо десь потрібно пройтися по всіх джерелах.
-    Важливо: тільки ті URL, які надав користувач.
-    """
-    out = []
-    out.append(mexc_futures_latest)               # MEXC Futures (uk-UA)
-    out.append(gate_spot_latest)                  # Gate Spot (gate.com/ru)
-    out.append(gate_futures_latest)               # Gate Futures (gate.com/ru)
-    out.append(bingx_spot_latest)                 # BingX Spot
-    out.append(bingx_futures_latest)              # BingX Futures
-    out.append(bitget_spot_latest)                # Bitget Spot
-    out.append(bitget_futures_latest)             # Bitget Futures
-    out.append(okx_latest)                        # OKX Spot+Futures (секція new listings)
-    out.append(binance_latest)                    # Binance Spot (+futures/alpha якщо є у пості)
-    return out
+    # реєстр колекторів анонсів
+    return [
+        mexc_futures_latest,
+        gate_spot_latest,
+        gate_futures_latest,
+        bingx_spot_latest,
+        bingx_futures_latest,
+        bitget_spot_latest,
+        bitget_futures_latest,
+        okx_latest,
+        binance_latest,
+    ]
