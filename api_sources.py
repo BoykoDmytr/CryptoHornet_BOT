@@ -10,6 +10,7 @@ from typing import Dict, List, Tuple, Optional
 import datetime as _dt
 import pytz as _pytz
 import requests
+from ann_sources import ann_lookup_listing_time  
 
 
 # --- optional time fallback from announcements (only for time) ---
@@ -705,12 +706,13 @@ def api_build_events_from_diff(
 def api_preview(exchange: str, market: str, limit: int = 5) -> List[dict]:
     snap = api_fetch_snapshot(exchange, market)
     events = []
-    for i, (pair, url) in enumerate(snap.items()):
-        if i >= max(1, int(limit)):
-            break
+    for pair, url in snap.items():
         base, quote = (pair.split("/", 1) + [""])[:2]
+
+        # 1) спроба взяти точний час із API біржі
         start_text, start_ts = api_lookup_listing_time(exchange, market, base, quote)
-        events.append({
+
+        ev = {
             "exchange": exchange.lower(),
             "market": market.lower(),
             "pair": pair,
@@ -718,10 +720,29 @@ def api_preview(exchange: str, market: str, limit: int = 5) -> List[dict]:
             "quote": quote,
             "url": url,
             "title": "тестова пара (API preview)",
-            "start_text": start_text,   # тепер тут буде час, якщо змогли дістати
+            "start_text": start_text,   # може бути None
             "start_dt": None,
-            "start_ts": start_ts,
-        })
+            "start_ts": start_ts,       # може бути None
+        }
+
+        # 2) якщо API часу не дав — підтягуємо всі можливі часи зі сторінок анонсів
+        if not start_text:
+            try:
+                res = ann_lookup_listing_time(exchange, market, base, quote)
+                # res може бути dict або (list, url) — у нас dict:
+                time_candidates = []
+                if isinstance(res, dict):
+                    time_candidates = res.get("time_candidates") or []
+                elif isinstance(res, (list, tuple)) and res:
+                    time_candidates = res[0] or []
+                if time_candidates:
+                    ev["time_candidates"] = time_candidates
+            except Exception:
+                pass
+
+        events.append(ev)
+        if len(events) >= max(1, int(limit)):
+            break
     return events
 
 
