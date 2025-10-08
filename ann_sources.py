@@ -440,3 +440,171 @@ def sources_matrix() -> List:
         okx_latest,
         binance_latest,
     ]
+
+# Індексні сторінки (тільки ті, що ти попросив)
+_INDEX_URLS = {
+    ("mexc", "futures"):  ["https://www.mexc.com/uk-UA/announcements/new-listings/19"],
+    ("gate", "spot"):     ["https://www.gate.com/ru/announcements/newspotlistings"],
+    ("gate", "futures"):  ["https://www.gate.com/ru/announcements/newfutureslistings"],
+    ("bingx", "spot"):    ["https://bingx.com/en/support/notice-center/11257060005007"],
+    ("bingx", "futures"): ["https://bingx.com/en/support/notice-center/11257015822991"],
+    ("bitget", "spot"):   ["https://www.bitget.com/support/sections/5955813039257"],
+    ("bitget", "futures"):["https://www.bitget.com/support/sections/12508313405000"],
+    ("okx", "spot"):      ["https://www.okx.com/ua/help/section/announcements-new-listings"],
+    ("okx", "futures"):   ["https://www.okx.com/ua/help/section/announcements-new-listings"],
+    ("binance", "spot"):  ["https://www.binance.com/en/support/announcement/list/48"],
+    ("binance", "futures"):["https://www.binance.com/en/support/announcement/list/48"],
+}
+
+# Які посилання на детальні статті вважати релевантними для кожної біржі
+def _is_detail_link(href: str, exchange: str) -> bool:
+    if not href:
+        return False
+    if exchange == "mexc":
+        return "/announcements/article/" in href
+    if exchange == "gate":
+        return ("/announcements/detail" in href) or ("/announcements/article" in href)
+    if exchange == "bingx":
+        return ("/support/announcements/" in href) or ("/support/notice-center/" in href)
+    if exchange == "bitget":
+        return "/support/articles/" in href
+    if exchange == "okx":
+        return "/help/articles/" in href
+    if exchange == "binance":
+        return "/support/announcement/" in href
+    return False
+
+def _abs_url(href: str, exchange: str) -> str:
+    if href.startswith("http"):
+        return href
+    base = {
+        "mexc":   "https://www.mexc.com",
+        "gate":   "https://www.gate.com",
+        "bingx":  "https://bingx.com",
+        "bitget": "https://www.bitget.com",
+        "okx":    "https://www.okx.com",
+        "binance":"https://www.binance.com",
+    }.get(exchange, "")
+    if not href.startswith("/"):
+        href = "/" + href
+    return base + href
+
+# Витягнути максимум варіантів часу з тексту
+def _extract_time_candidates_from_text(text: str) -> list[str]:
+    cands = []
+    # 1) Наш головний парсер (повертає один «гарний» дисплей)
+    dt, disp = parse_dt_and_display(text)
+    if disp:
+        cands.append(disp)
+
+    # 2) Усі згадки «HH:MM TZ»
+    for m in RE_TZ_LABEL.finditer(text):
+        hh = m.group("h")
+        mm = m.group("m")
+        lb = (m.group("label") or "").upper()
+        cands.append(f"{hh}:{mm} {lb}")
+
+    # 3) Простий ISO-подібний формат дати/часу без TZ
+    for m in re.finditer(r"\b(20\d{2}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})\b", text):
+        cands.append(f"{m.group(1)} {m.group(2)}")
+
+    # 4) Локальні формати типу «HH:MM (за Києвом)»
+    for m in RE_KYIV_LABEL.finditer(text):
+        t = m.group("t")
+        cands.append(f"{t} (за Києвом)")
+
+    # унікалізація з порядком
+    seen, out = set(), []
+    for t in cands:
+        t = (t or "").strip()
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+def _looks_like_market(text: str, market: str) -> bool:
+    """
+    Дуже проста евристика: якщо futures — шукаємо згадки futures/perpetual/swap;
+    якщо spot — відкидаємо явні futures-згадки.
+    """
+    t = (text or "").lower()
+    fut = any(k in t for k in ["futures", "perpetual", "swap", "фьючер", "ф'ючер", "usdt-m"])
+    if market == "futures":
+        return fut
+    # spot:
+    return not fut
+
+def _find_article_for_pair(exchange: str, market: str, base: str, quote: str) -> tuple[list[str], str | None]:
+    """
+    Повертає (time_candidates, source_url) для конкретної пари з оголошень біржі.
+    Якщо не знайдено — ([], None).
+    """
+    ex = exchange.lower()
+    mk = market.lower()
+    idx_urls = _INDEX_URLS.get((ex, mk)) or []
+    if not idx_urls:
+        return [], None
+
+    base_u = (base or "").upper()
+    quote_u = (quote or "").upper()
+
+    for idx in idx_urls:
+        try:
+            html = get_html(idx)
+        except Exception:
+            continue
+
+        soup = BeautifulSoup(html, "html.parser")
+        # з індексної — збираємо посилання на статті
+        links = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if _is_detail_link(href, ex):
+                links.append(_abs_url(href, ex))
+        links = uniq(links)[:30]
+
+        # проходимо статті й шукаємо ту, де є наша пара та збігається ринок
+        for u in links:
+            try:
+                s = BeautifulSoup(get_html(u), "html.parser")
+            except Exception:
+                continue
+
+            title = s.find(["h1", "h2"])
+            title_text = title.get_text(" ", strip=True) if title else ""
+            plain = s.get_text(" ", strip=True)
+            syms = extract_symbols(plain)  # повертає список BASE із контексту .../USDT
+            # Фільтр по парі (base/quote)
+            if base_u not in syms:
+                # іноді символ у заголовку, підстрахуємось:
+                if base_u not in extract_symbols(title_text):
+                    continue
+
+            # Фільтр по ринку
+            blob = f"{title_text}\n{plain}"
+            if not _looks_like_market(blob, mk):
+                continue
+
+            # Виймаємо усі можливі варіанти часу з тексту
+            cands = _extract_time_candidates_from_text(blob)
+            if cands:
+                return cands, u
+
+    return [], None
+
+def ann_lookup_listing_time(exchange: str, market: str, base: str, quote: str) -> dict:
+    """
+    Публічний API для app.py:
+      - Повертає dict з полями:
+          {
+            "time_candidates": [ "2025-10-08 07:40 UTC+8", "07:40 (за Києвом)", ... ],
+            "source_url": "https://.../article/...."
+          }
+      - Якщо нічого не знайшли: {"time_candidates": [], "source_url": None}
+
+    Якщо твій app.py очікує інтерфейс виду (list[str], Optional[str]) —
+    просто заміни return на: `return cands, url`
+    """
+    cands, url = _find_article_for_pair(exchange, market, base, quote)
+    return {"time_candidates": cands, "source_url": url}
+# === END ADDITION =============================================================
