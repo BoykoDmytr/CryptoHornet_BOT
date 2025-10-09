@@ -163,7 +163,7 @@ SUPPORTED: Dict[str, Tuple[bool, bool]] = {
     "gate":    (True, True),
     "bitget":  (True, True),
     "mexc":    (False, True),  # MEXC spot вимкнено "на корені"
-    "bingx":   (False, True),
+    "bingx":   (True, True),
     "bybit":   (True, True),
     "bithumb": (True, False),
     "upbit":   (True, False),
