@@ -78,6 +78,22 @@ ANN_FEEDS = [
 # =========================
 _state_lock = asyncio.Lock()
 
+# десь зверху
+def _safe_err(e):
+    try:
+        return str(e)
+    except Exception:
+        try:
+            return repr(e)
+        except Exception:
+            return "<error>"
+
+# ... у всіх except де є log.warning(..., e) або log.info(..., e)
+    except Exception as e:
+        log.warning("api %s/%s error: %s", ex, mk, _safe_err(e))
+        return {}
+
+
 # Структура:
 # {
 #   "snapshots": { "exchange|market": { "PAIR": "url" } },
