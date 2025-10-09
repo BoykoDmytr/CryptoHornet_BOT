@@ -130,7 +130,7 @@ def _format_event_text(ev: dict) -> str:
     return "\n".join(lines)
 
 # --- кордони "сьогодні" у київському часі ---
-_KYIV_TZ = pytz.timezone("Europe/Kyiv")
+_KYIV_TZ = _pytz.timezone("Europe/Kyiv")
 
 def _today_bounds_ms_kyiv() -> tuple[int, int]:
     now = datetime.now(_KYIV_TZ)
