@@ -394,10 +394,18 @@ def _okx_spot() -> Dict[str, str]:
         if not inst_id or "-" not in inst_id:
             continue
         base, quote = inst_id.split("-")[0].upper(), inst_id.split("-")[1].upper()
+
+        # 💡 ключова правка: пропускати все, що ще не live/listed/trading
+        state = (it.get("state") or it.get("status") or "").lower()
+        if state and state not in ("live", "listed", "trading"):
+            continue
+
         if ONLY_USDT and quote != "USDT":
             continue
+
         out[f"{base}/{quote}"] = f"https://www.okx.com/trade-spot/{base}-{quote}"
     return out
+
 
 def _okx_futures() -> Dict[str, str]:
     j = _get_json("https://www.okx.com/api/v5/public/instruments", params={"instType": "SWAP"})

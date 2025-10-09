@@ -12,7 +12,13 @@ from typing import Dict, Tuple, List, Optional
 from datetime import datetime
 
 from ann_sources import ann_lookup_listing_time, binance_upcoming_announcements
-
+from ann_sources import (
+    mexc_futures_latest,
+    gate_spot_latest, gate_futures_latest,
+    bingx_spot_latest, bingx_futures_latest,
+    bitget_spot_latest, bitget_futures_latest,
+    okx_latest, binance_latest,
+)
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -58,6 +64,14 @@ ANN_INTERVAL_SEC = int(os.environ.get("ANN_INTERVAL_SEC", "450") or "450")
 ENABLE_POLLING = os.environ.get("ENABLE_POLLING", "1") not in ("0", "false", "no")
 
 STATE_FILE = os.environ.get("STATE_FILE", "./state.json")
+
+ANN_FEEDS = [
+    mexc_futures_latest,
+    gate_spot_latest, gate_futures_latest,
+    bingx_spot_latest, bingx_futures_latest,
+    bitget_spot_latest, bitget_futures_latest,
+    okx_latest, binance_latest,
+]
 
 # =========================
 #   ЗБЕРЕЖЕННЯ СТАНУ
@@ -135,7 +149,7 @@ _KYIV_TZ = _pytz.timezone("Europe/Kyiv")
 def _today_bounds_ms_kyiv() -> tuple[int, int]:
     now = datetime.now(_KYIV_TZ)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start.replace(day=start.day) + pytz.timedelta(days=1)
+    end = start.replace(day=start.day) + _pytz.timedelta(days=1)
     # timedelta з pytz: беремо з datetime stdlib
     from datetime import timedelta as _td
     end = start + _td(days=1)
@@ -457,6 +471,91 @@ async def api_pairs_loop(app):
 
         await asyncio.sleep(API_PAIRS_INTERVAL_SEC)
 
+async def ann_post_loop(app):
+    """
+    Публікує ЗАЗДАЛЕГІДЬ по офіційних анонсах (до старту торгів).
+    - дивиться останні статті з ANN_FEEDS
+    - формує події на всі згадані символи
+    - якщо такого exchange|market|pair ще не постили — постить
+    - одразу ставить start_text з анонсу (якщо є)
+    """
+    await asyncio.sleep(7.0)
+    while True:
+        try:
+            # зібрати всі анонси
+            all_items = []
+            for fn in ANN_FEEDS:
+                try:
+                    all_items.extend(fn() or [])
+                except Exception:
+                    continue
+
+            if not all_items:
+                await asyncio.sleep(ANN_INTERVAL_SEC)
+                continue
+
+            async with _state_lock:
+                state = _load_state()
+                posted: Dict[str, dict] = state.get("posted", {})
+
+            new_count = 0
+            for a in all_items:
+                ex = a.get("exchange"); mk = a.get("market")
+                syms = a.get("symbols") or []
+                st = a.get("start_text")
+                url_src = a.get("url")
+                title = a.get("title") or "анонс лістингу"
+
+                for base in syms:
+                    pair = f"{base}/USDT"
+                    kk = _kp(ex, mk, pair)
+                    if kk in posted:
+                        continue  # вже публікували
+
+                    # Сконструюємо URL на тікер із наших API-правил, або лишимо джерело
+                    # Спробуємо взяти URL із поточного снапшоту
+                    async with _state_lock:
+                        snap_url = _load_state().get("snapshots", {}).get(_k(ex, mk), {}).get(pair)
+
+                    url = snap_url or url_src or ""
+                    ev = {
+                        "exchange": ex, "market": mk, "pair": pair,
+                        "base": base, "quote": "USDT",
+                        "url": url or url_src or "",
+                        "title": title,
+                        "start_text": st,
+                        "source_url": url_src,
+                    }
+
+                    # Якщо в анонсі часу немає — доберемо через API/інші анонси
+                    ev = await _enrich_with_times(ev)
+
+                    # пост
+                    msg_id = await _post_event(app, ev)
+                    if not msg_id:
+                        continue
+
+                    rec = dict(ev)
+                    rec["message_id"] = msg_id
+                    rec["chat_id"] = TARGET_CHAT_ID or OWNER_CHAT_ID
+                    rec["have_time"] = bool(ev.get("start_text"))
+
+                    async with _state_lock:
+                        state = _load_state()
+                        state.setdefault("posted", {})[kk] = rec
+                        _save_state(state)
+
+                    new_count += 1
+                    await asyncio.sleep(0.05)
+
+            if new_count == 0:
+                log.info("ann_post_loop: нових анонсів не знайдено")
+
+        except Exception as e:
+            log.exception("ann_post_loop error: %s", e)
+
+        await asyncio.sleep(ANN_INTERVAL_SEC // 2)  # частіше, ніж enrich
+
 
 async def ann_enrich_loop(app):
     """
@@ -623,6 +722,8 @@ async def main():
     asyncio.create_task(api_pairs_loop(app))
     asyncio.create_task(ann_enrich_loop(app))
     asyncio.create_task(binance_announce_loop(app.bot))
+    asyncio.create_task(ann_post_loop(app))
+
 
 
     if ENABLE_POLLING:
