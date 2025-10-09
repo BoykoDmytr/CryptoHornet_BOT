@@ -426,6 +426,18 @@ def binance_latest(rows: int = 20) -> List[Dict[str, Any]]:
     links = _collect_generic(URLS["binance_all"])
     return [_article_to_record(u, "binance", "spot") for u in links]
 
+def binance_upcoming_announcements(limit: int = 20) -> list[dict]:
+    """
+    Повертає тільки ті анонси, де є символи і є дата/час у тексті або метаданих.
+    Використовується для прямих постів "до старту" (без залежності від API).
+    """
+    items = []
+    for it in binance_latest(rows=limit):
+        if (it.get("symbols") and (it.get("start_text") or it.get("start_dt"))):
+            items.append(it)
+    return items
+
+
 
 def sources_matrix() -> List:
     # реєстр колекторів анонсів
@@ -594,17 +606,69 @@ def _find_article_for_pair(exchange: str, market: str, base: str, quote: str) ->
 
 def ann_lookup_listing_time(exchange: str, market: str, base: str, quote: str) -> dict:
     """
-    Публічний API для app.py:
-      - Повертає dict з полями:
-          {
-            "time_candidates": [ "2025-10-08 07:40 UTC+8", "07:40 (за Києвом)", ... ],
-            "source_url": "https://.../article/...."
-          }
-      - Якщо нічого не знайшли: {"time_candidates": [], "source_url": None}
-
-    Якщо твій app.py очікує інтерфейс виду (list[str], Optional[str]) —
-    просто заміни return на: `return cands, url`
+    Повертає:
+      {
+        "time_candidates": ["2025-10-08 07:40 UTC+8", "04:23 UTC", "07:40 (за Києвом)"],
+        "best": "2025-10-08 07:40 UTC+8",   # якщо можемо вибрати найкращий
+        "best_ts": 1696741200000,           # мс, якщо вдалося розпізнати
+      }
+    Якщо нічого не знайшли — повертаємо {}.
     """
-    cands, url = _find_article_for_pair(exchange, market, base, quote)
-    return {"time_candidates": cands, "source_url": url}
+    base = (base or "").upper()
+    quote = (quote or "").upper()
+
+    # 1) збираємо останні статті по конкретній біржі/секції
+    articles = []
+    ex = (exchange or "").lower()
+    mk = (market or "").lower()
+
+    try:
+        if ex == "gate":
+            articles = gate_spot_latest() if mk == "spot" else gate_futures_latest()
+        elif ex == "mexc" and mk == "futures":
+            articles = mexc_futures_latest()
+        elif ex == "bingx":
+            articles = bingx_spot_latest() if mk == "spot" else bingx_futures_latest()
+        elif ex == "bitget":
+            articles = bitget_spot_latest() if mk == "spot" else bitget_futures_latest()
+        elif ex == "okx":
+            articles = okx_latest()
+        elif ex == "binance":
+            articles = binance_latest()
+        else:
+            articles = []
+    except Exception:
+        articles = []
+
+    # 2) знаходимо статті, де згадується BASE/USDT
+    cand_times = []
+    best = None
+    best_ts = None
+
+    for art in articles:
+        syms = art.get("symbols") or []
+        if base not in syms:
+            continue
+        # ми вже витягали start_text/start_dt на етапі парсингу
+        disp = art.get("start_text")
+        if disp and disp not in cand_times:
+            cand_times.append(disp)
+            # спробуємо сформувати ts
+            dt = art.get("start_dt")
+            if dt:
+                ts = int(dt.timestamp() * 1000)
+                # евристика: беремо найближчий майбутній/свіжий час як "best"
+                if not best_ts or ts > best_ts:
+                    best_ts = ts
+                    best = disp
+
+    out = {}
+    if cand_times:
+        out["time_candidates"] = cand_times
+    if best:
+        out["best"] = best
+    if best_ts:
+        out["best_ts"] = best_ts
+    return out
+
 # === END ADDITION =============================================================

@@ -5,9 +5,14 @@ import os
 import json
 import asyncio
 import logging
+import time
+import pytz
 from typing import Dict, Tuple, List, Optional
 
 from datetime import datetime
+
+from ann_sources import ann_lookup_listing_time, binance_upcoming_announcements
+
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -28,6 +33,8 @@ from api_sources import (
 )
 from ann_sources import ann_lookup_listing_time
 
+
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -43,6 +50,7 @@ if not BOT_TOKEN:
 
 OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID", "0") or "0")
 TARGET_CHAT_ID = int(os.environ.get("TARGET_CHAT_ID", "0") or "0")
+BINANCE_ANN_CACHE = set()
 
 API_SEED_ON_START = os.environ.get("API_SEED_ON_START", "1") not in ("0", "false", "no")
 API_PAIRS_INTERVAL_SEC = int(os.environ.get("API_PAIRS_INTERVAL_SEC", "300") or "300")
@@ -96,7 +104,7 @@ def _display_market(mk: str) -> str:
     return "spot" if mk.lower() == "spot" else "futures"
 
 def _format_event_text(ev: dict) -> str:
-    # Шлемо plain-text, без Markdown/HTML — щоб уникати 400 "can't parse entities".
+    # Plain-text, без Markdown/HTML — щоб не ловити 400 parse entities.
     ex = _display_exchange(ev.get("exchange", ""))
     mk = _display_market(ev.get("market", ""))
     pair = ev.get("pair", "")
@@ -107,22 +115,175 @@ def _format_event_text(ev: dict) -> str:
     lines.append(f"✅ {ex} — {mk} {title}")
     lines.append(f"Пара: {pair}")
 
-    # 1) Точно відомий час (із API біржі)
+    # 1) точний час
     if ev.get("start_text"):
         lines.append(f"🕒 Старт: {ev['start_text']}")
 
-    # 2) Якщо API не дав час — друкуємо всі знайдені кандидати з парсингу
+    # 2) кандидати часу з парсингу
     cand = ev.get("time_candidates") or []
     if cand:
         lines.append("🕒 Можливі часи:")
-        # покажемо до 5 — щоб не роздувати пост; решта все одно є у БД/об’єкті
         for t in cand[:5]:
             lines.append(f"• {t}")
 
     lines.append(f"🔗 Тікер: {url}")
     return "\n".join(lines)
 
+# --- кордони "сьогодні" у київському часі ---
+_KYIV_TZ = pytz.timezone("Europe/Kyiv")
 
+def _today_bounds_ms_kyiv() -> tuple[int, int]:
+    now = datetime.now(_KYIV_TZ)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start.replace(day=start.day) + pytz.timedelta(days=1)
+    # timedelta з pytz: беремо з datetime stdlib
+    from datetime import timedelta as _td
+    end = start + _td(days=1)
+    # робимо їх "aware"
+    if start.tzinfo is None:
+        start = _KYIV_TZ.localize(start)
+    if end.tzinfo is None:
+        end = _KYIV_TZ.localize(end)
+    return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+
+def _is_today_kyiv_ms(ts_ms: int | None) -> bool:
+    if not ts_ms:
+        return True  # якщо старих записів без мітки — вважаємо "сьогодні", щоб перезапустити
+    lo, hi = _today_bounds_ms_kyiv()
+    return lo <= ts_ms < hi
+
+
+# --- фільтр давніх лістингів (щоб не спамити історією) ---
+try:
+    POST_DAYS_BACK = int(os.getenv("POST_DAYS_BACK", "1"))
+except Exception:
+    POST_DAYS_BACK = 1
+
+def _ts_is_recent(ts_ms: Optional[int], days: int = POST_DAYS_BACK) -> bool:
+    """
+    True, якщо подія свіжа (за останні days днів) або немає ts.
+    """
+    if not ts_ms:
+        return True
+    import time
+    now_ms = int(time.time() * 1000)
+    return (now_ms - ts_ms) <= days * 86400000
+
+async def cmd_refresh_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Перезапустити збагачення СЬОГОДНІШНІХ постів і відредагувати повідомлення,
+    якщо з'явився/змінився час.
+    Використання:
+      /refresh_today            -> обробити лиш ті, де часу ще нема
+      /refresh_today all        -> обробити ВСІ сьогоднішні (і з часом теж)
+    """
+    mode = (ctx.args[0].lower() if ctx.args else "missing")
+    only_missing = (mode != "all")
+
+    async with _state_lock:
+        state = _load_state()
+        posted: Dict[str, dict] = state.get("posted", {}).copy()
+
+    total_checked = 0
+    total_edited = 0
+    total_candidates = 0
+
+    for kk, rec in posted.items():
+        # відбираємо лише сьогоднішні за Києвом
+        if not _is_today_kyiv_ms(rec.get("posted_at_ms")):
+            continue
+
+        if only_missing and rec.get("have_time"):
+            continue  # пропускаємо ті, де час уже є
+
+        total_checked += 1
+
+        # пере-збагачення
+        new_rec = await _enrich_with_times(dict(rec))
+
+        # Збережемо кандидатів часу, якщо парсер їх повертає через ev["time_candidates"]
+        if new_rec.get("time_candidates"):
+            total_candidates += 1
+
+        # чи є сенс редагувати?
+        need_edit = False
+        if (rec.get("start_text") or "") != (new_rec.get("start_text") or ""):
+            need_edit = True
+        if not need_edit and new_rec.get("title") and new_rec.get("title") != rec.get("title"):
+            # якщо підтягнувся кращий заголовок з анонса
+            need_edit = True
+
+        if need_edit:
+            ok = await _edit_event(ctx, new_rec)
+            if ok:
+                new_rec["have_time"] = bool(new_rec.get("start_text"))
+                async with _state_lock:
+                    state = _load_state()
+                    state.setdefault("posted", {})[kk] = new_rec
+                    _save_state(state)
+                total_edited += 1
+
+        await asyncio.sleep(0.05)
+
+    msg = (
+        f"🔁 Refresh today завершено.\n"
+        f"Перевірено: {total_checked}\n"
+        f"Оновлено повідомлень: {total_edited}\n"
+        f"Є кандидати часу: {total_candidates}\n"
+        f"Режим: {'тільки без часу' if only_missing else 'ALL'}"
+    )
+    await update.message.reply_text(msg)
+
+
+async def binance_announce_loop(bot):
+    import asyncio, time
+    chat_id = int(os.getenv("TARGET_CHAT_ID", "0") or "0")
+    while True:
+        try:
+            anns = binance_upcoming_announcements(limit=20)
+            for a in anns:
+                ex = "binance"
+                mk = a.get("market") or "spot"   # там може бути "futures" чи "alpha"
+                url = a.get("url") or ""
+                bases = a.get("symbols") or []
+                dt = a.get("start_dt")
+                disp = a.get("start_text")
+                ts_ms = int(dt.timestamp() * 1000) if dt else None
+
+                for base in bases:
+                    key = f"{url}|{base}"
+                    if key in BINANCE_ANN_CACHE:
+                        continue
+                    BINANCE_ANN_CACHE.add(key)
+
+                    ev = {
+                        "exchange": ex,
+                        "market": mk,
+                        "pair": f"{base}/USDT",
+                        "base": base,
+                        "quote": "USDT",
+                        "url": url,
+                        "title": "анонс лістингу",
+                        "start_text": disp,
+                        "start_dt": dt,
+                        "start_ts": ts_ms,
+                        "ann_ts": ts_ms,
+                    }
+
+                    # той самий фільтр давнини:
+                    if ts_ms and not _ts_is_recent(ts_ms, int(os.getenv("POST_DAYS_BACK", "1"))):
+                        continue
+
+                    text = _format_event_text(ev)
+                    try:
+                        await bot.send_message(chat_id=chat_id, text=text)
+                    except Exception:
+                        pass
+
+        except Exception:
+            pass
+
+        await asyncio.sleep(300)  # кожні 5 хв
 
 async def _post_event(ctx: ContextTypes.DEFAULT_TYPE, ev: dict) -> Optional[int]:
     chat_id = TARGET_CHAT_ID or OWNER_CHAT_ID
@@ -225,6 +386,11 @@ async def api_pairs_loop(app):
                     if kk in posted:
                         continue  # на випадок рестартів/гонок
                     # пост
+                        # відсікаємо надто старі лістинги (наприклад, коли біржа раптом віддала історію)
+                    ts_ms = ev.get("start_ts") or ev.get("ann_ts")
+                    if ts_ms and not _ts_is_recent(ts_ms):
+                        continue
+
                     msg_id = await _post_event(app, ev)
                     if not msg_id:
                         continue
@@ -232,6 +398,7 @@ async def api_pairs_loop(app):
                     rec["message_id"] = msg_id
                     rec["chat_id"] = TARGET_CHAT_ID or OWNER_CHAT_ID
                     rec["have_time"] = bool(ev.get("start_text"))
+                    rec["posted_at_ms"] = int(time.time() * 1000)
                     async with _state_lock:
                         state = _load_state()
                         state.setdefault("posted", {})[kk] = rec
@@ -382,6 +549,7 @@ async def cmd_inject(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rec["message_id"] = msg_id
     rec["chat_id"] = TARGET_CHAT_ID or OWNER_CHAT_ID
     rec["have_time"] = bool(ev.get("start_text"))
+    rec["posted_at_ms"] = int(time.time() * 1000)
     kk = _kp(ex, mk, f"{base}/{quote}")
     async with _state_lock:
         state = _load_state()
@@ -399,6 +567,8 @@ async def main():
     app.add_handler(CommandHandler("seed", cmd_seed))
     app.add_handler(CommandHandler("preview", cmd_preview))
     app.add_handler(CommandHandler("inject", cmd_inject))
+    app.add_handler(CommandHandler("refresh_today", cmd_refresh_today))
+
 
     # Попередній seed (опційно)
     if API_SEED_ON_START:
@@ -413,6 +583,8 @@ async def main():
     #app.job_queue.run_repeating(lambda *_: None, interval=3600, first=0)  # dummy, щоб job_queue існував
     asyncio.create_task(api_pairs_loop(app))
     asyncio.create_task(ann_enrich_loop(app))
+    asyncio.create_task(binance_announce_loop(app.bot))
+
 
     if ENABLE_POLLING:
         await app.initialize()

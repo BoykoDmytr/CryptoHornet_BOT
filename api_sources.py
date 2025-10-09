@@ -10,7 +10,7 @@ from typing import Dict, List, Tuple, Optional
 import datetime as _dt
 import pytz as _pytz
 import requests
-from ann_sources import ann_lookup_listing_time  
+from ann_sources import ann_lookup_listing_time, binance_upcoming_announcements  
 
 
 # --- optional time fallback from announcements (only for time) ---
@@ -681,15 +681,16 @@ def api_build_events_from_diff(
 ) -> List[dict]:
     prev_keys = set(prev_pairs.keys()) if prev_pairs else set()
     events: List[dict] = []
+
     for pair, url in cur_pairs.items():
         if pair in prev_keys:
             continue
         base, quote = (pair.split("/", 1) + [""])[:2]
 
-        # Одразу спробуємо дістати час через API (якщо пощастить)
+        # 1) час із API (де є): binance/okx/gate/bybit/... (ми вже реалізували)
         start_text, start_ts = api_lookup_listing_time(exchange, market, base, quote)
 
-        events.append({
+        ev = {
             "exchange": exchange.lower(),
             "market": market.lower(),
             "pair": pair,
@@ -697,19 +698,34 @@ def api_build_events_from_diff(
             "quote": quote,
             "url": url,
             "title": "нова пара (API)",
-            "start_text": start_text,   # якщо None — бот спробує добрати через анонси
+            "start_text": start_text,     # може бути None
             "start_dt": None,
-            "start_ts": start_ts if start_text else None,
-        })
+            "start_ts": start_ts,         # може бути None
+        }
+
+        # 2) якщо API не дав час — одразу беремо кандидати з анонсів
+        if not start_text:
+            try:
+                enrich = ann_lookup_listing_time(exchange, market, base, quote) or {}
+                # enrich = {"time_candidates": [...], "best": "...", "best_ts": 123456}
+                tlist = enrich.get("time_candidates") or []
+                if tlist:
+                    ev["time_candidates"] = tlist
+                if not start_ts and enrich.get("best_ts"):
+                    ev["ann_ts"] = int(enrich["best_ts"])  # для фільтра «старі/свіжі»
+            except Exception:
+                pass
+
+        events.append(ev)
+
     return events
+
 
 def api_preview(exchange: str, market: str, limit: int = 5) -> List[dict]:
     snap = api_fetch_snapshot(exchange, market)
     events = []
     for pair, url in snap.items():
         base, quote = (pair.split("/", 1) + [""])[:2]
-
-        # 1) спроба взяти точний час із API біржі
         start_text, start_ts = api_lookup_listing_time(exchange, market, base, quote)
 
         ev = {
@@ -720,23 +736,19 @@ def api_preview(exchange: str, market: str, limit: int = 5) -> List[dict]:
             "quote": quote,
             "url": url,
             "title": "тестова пара (API preview)",
-            "start_text": start_text,   # може бути None
+            "start_text": start_text,
             "start_dt": None,
-            "start_ts": start_ts,       # може бути None
+            "start_ts": start_ts,
         }
 
-        # 2) якщо API часу не дав — підтягуємо всі можливі часи зі сторінок анонсів
         if not start_text:
             try:
-                res = ann_lookup_listing_time(exchange, market, base, quote)
-                # res може бути dict або (list, url) — у нас dict:
-                time_candidates = []
-                if isinstance(res, dict):
-                    time_candidates = res.get("time_candidates") or []
-                elif isinstance(res, (list, tuple)) and res:
-                    time_candidates = res[0] or []
-                if time_candidates:
-                    ev["time_candidates"] = time_candidates
+                enrich = ann_lookup_listing_time(exchange, market, base, quote) or {}
+                tlist = enrich.get("time_candidates") or []
+                if tlist:
+                    ev["time_candidates"] = tlist
+                if not start_ts and enrich.get("best_ts"):
+                    ev["ann_ts"] = int(enrich["best_ts"])
             except Exception:
                 pass
 
@@ -744,6 +756,7 @@ def api_preview(exchange: str, market: str, limit: int = 5) -> List[dict]:
         if len(events) >= max(1, int(limit)):
             break
     return events
+
 
 
 ALL_EXCHANGES: List[Tuple[str, str]] = []
