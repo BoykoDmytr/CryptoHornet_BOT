@@ -6,7 +6,7 @@ import json
 import asyncio
 import logging
 import time
-import pytz
+import pytz as _pytz
 from typing import Dict, Tuple, List, Optional
 
 from datetime import datetime
@@ -146,11 +146,18 @@ def _today_bounds_ms_kyiv() -> tuple[int, int]:
         end = _KYIV_TZ.localize(end)
     return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
-def _is_today_kyiv_ms(ts_ms: int | None) -> bool:
-    if not ts_ms:
-        return True  # якщо старих записів без мітки — вважаємо "сьогодні", щоб перезапустити
-    lo, hi = _today_bounds_ms_kyiv()
-    return lo <= ts_ms < hi
+def _is_today_kyiv(ts: Optional[int]) -> bool:
+    """
+    true, якщо unix-час ts попадає на сьогоднішню дату за Києвом.
+    Якщо ts немає (None/0) — вважаємо, що це сьогодні (щоб не пропускати записи).
+    """
+    if not ts:
+        return True
+    kyiv = _pytz.timezone("Europe/Kyiv")
+    dt = datetime.fromtimestamp(ts, tz=_pytz.utc).astimezone(kyiv)
+    today = datetime.now(kyiv).date()
+    return dt.date() == today
+
 
 
 # --- фільтр давніх лістингів (щоб не спамити історією) ---
@@ -171,68 +178,100 @@ def _ts_is_recent(ts_ms: Optional[int], days: int = POST_DAYS_BACK) -> bool:
 
 async def cmd_refresh_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
-    Перезапустити збагачення СЬОГОДНІШНІХ постів і відредагувати повідомлення,
-    якщо з'явився/змінився час.
-    Використання:
-      /refresh_today            -> обробити лиш ті, де часу ще нема
-      /refresh_today all        -> обробити ВСІ сьогоднішні (і з часом теж)
+    /refresh_today            -> перевіряє СЬОГОДНІШНІ пости без часу
+    /refresh_today all        -> перевіряє СЬОГОДНІШНІ пости всі (навіть якщо час уже був)
     """
-    mode = (ctx.args[0].lower() if ctx.args else "missing")
+    mode = (ctx.args[0].lower() if ctx.args else "").strip()
     only_missing = (mode != "all")
 
     async with _state_lock:
         state = _load_state()
-        posted: Dict[str, dict] = state.get("posted", {}).copy()
+        posted: Dict[str, dict] = state.get("posted", {})
 
-    total_checked = 0
-    total_edited = 0
-    total_candidates = 0
+    checked = 0
+    updated = 0
+    had_candidates = 0
 
-    for kk, rec in posted.items():
-        # відбираємо лише сьогоднішні за Києвом
-        if not _is_today_kyiv_ms(rec.get("posted_at_ms")):
+    for kk, rec in list(posted.items()):
+        # лише сьогоднішні
+        if not _is_today_kyiv(rec.get("posted_ts")):
+            continue
+        # якщо тільки без часу — скіпаємо ті, де час уже є
+        if only_missing and rec.get("have_time"):
             continue
 
-        if only_missing and rec.get("have_time"):
-            continue  # пропускаємо ті, де час уже є
+        checked += 1
 
-        total_checked += 1
+        # пробуємо збагачення як у звичайному циклі
+        before_txt = rec.get("start_text")
+        rec2 = await _enrich_with_times(dict(rec))
 
-        # пере-збагачення
-        new_rec = await _enrich_with_times(dict(rec))
-
-        # Збережемо кандидатів часу, якщо парсер їх повертає через ev["time_candidates"]
-        if new_rec.get("time_candidates"):
-            total_candidates += 1
-
-        # чи є сенс редагувати?
-        need_edit = False
-        if (rec.get("start_text") or "") != (new_rec.get("start_text") or ""):
-            need_edit = True
-        if not need_edit and new_rec.get("title") and new_rec.get("title") != rec.get("title"):
-            # якщо підтягнувся кращий заголовок з анонса
-            need_edit = True
-
-        if need_edit:
-            ok = await _edit_event(ctx, new_rec)
+        # якщо з’явився точний час — редагуємо і позначаємо have_time
+        if rec2.get("start_text") and rec2.get("start_text") != before_txt:
+            ok = await _edit_event(ctx, rec2)
             if ok:
-                new_rec["have_time"] = bool(new_rec.get("start_text"))
+                rec2["have_time"] = True
                 async with _state_lock:
                     state = _load_state()
-                    state.setdefault("posted", {})[kk] = new_rec
+                    state.setdefault("posted", {})[kk] = rec2
                     _save_state(state)
-                total_edited += 1
+                updated += 1
+                continue
+
+        # Якщо точного часу все ще нема — спробуємо витягти всі кандидати
+        # (щоб ТИ побачив декілька варіантів у пості і вирішив, що залишити)
+        ex = rec.get("exchange", "")
+        mk = rec.get("market", "")
+        base = rec.get("base") or (rec.get("pair","").split("/",1)[0] if rec.get("pair") else "")
+        quote = rec.get("quote") or (rec.get("pair","").split("/",1)[1] if rec.get("pair") else "")
+
+        # ann_lookup_listing_time вже повертає один best. Спробуємо витягти ще з цієї ж статті.
+        try:
+            # ann_lookup_listing_time(exchange, market, base, quote) -> (start_text, source_url, title)
+            _best, src_url, _title = ann_lookup_listing_time(ex, mk, base, quote)
+            # якщо є URL статті — дістанемо з неї всі рядки часу
+            time_candidates: List[str] = []
+            if src_url:
+                from bs4 import BeautifulSoup
+                from ann_sources import get_html, parse_dt_and_display
+
+                html = get_html(src_url)
+                soup = BeautifulSoup(html, "html.parser")
+                plain = soup.get_text(" ", strip=True)
+
+                # дуже просте виокремлення усіх підряд матчів з parse_dt_and_display:
+                # розіб’ємо текст на речення і проганяємо кожне
+                parts = [p.strip() for p in plain.split(".") if p.strip()]
+                seen = set()
+                for p in parts:
+                    dt, disp = parse_dt_and_display(p)
+                    if disp and disp not in seen:
+                        seen.add(disp)
+                        time_candidates.append(disp)
+
+                if time_candidates:
+                    rec2["time_candidates"] = time_candidates[:6]
+                    ok = await _edit_event(ctx, rec2)
+                    if ok:
+                        async with _state_lock:
+                            state = _load_state()
+                            state.setdefault("posted", {})[kk] = rec2
+                            _save_state(state)
+                        had_candidates += 1
+        except Exception:
+            pass
 
         await asyncio.sleep(0.05)
 
-    msg = (
-        f"🔁 Refresh today завершено.\n"
-        f"Перевірено: {total_checked}\n"
-        f"Оновлено повідомлень: {total_edited}\n"
-        f"Є кандидати часу: {total_candidates}\n"
-        f"Режим: {'тільки без часу' if only_missing else 'ALL'}"
+    mode_label = "тільки без часу" if only_missing else "ALL"
+    await update.message.reply_text(
+        "🔁 Refresh today завершено.\n"
+        f"Перевірено: {checked}\n"
+        f"Оновлено повідомлень: {updated}\n"
+        f"Є кандидати часу: {had_candidates}\n"
+        f"Режим: {mode_label}"
     )
-    await update.message.reply_text(msg)
+
 
 
 async def binance_announce_loop(bot):
