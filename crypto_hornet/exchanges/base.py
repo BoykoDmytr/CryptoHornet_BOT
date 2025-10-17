@@ -28,8 +28,12 @@ class Feed:
 
 
 async def get_json(client: httpx.AsyncClient, url: str, *, params: Mapping[str, str] | None = None, headers: Mapping[str, str] | None = None) -> object:
-    response = await client.get(url, params=params, headers=headers)
-    response.raise_for_status()
+    try:
+        response = await client.get(url, params=params, headers=headers)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        log.warning("Failed to fetch %s: %s", url, exc)
+        return {}
     content_type = response.headers.get("content-type", "").lower()
     text = response.text
     if "application/json" in content_type or text.strip().startswith("{") or text.strip().startswith("["):
