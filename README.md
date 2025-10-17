@@ -1,55 +1,79 @@
-# Crypto Hornet Listings Bot — MVP
+# Crypto Hornet — Exchange Listings Watcher
 
-Бот автоматично **збирає повідомлення про лістинги** з вказаних Telegram‑каналів (user‑клієнтом через MTProto/Telethon), **парсить** їх у події та **публікує зведення** у ваш канал від імені *Telegram‑бота* (Bot API).
+Crypto Hornet now focuses on **direct exchange APIs** instead of Telegram scraping. The bot polls the official endpoints for Binance, OKX, Gate.io, Bitget, MEXC, BingX and Bybit (spot and futures where available) and instantly posts every newly listed USDT pair to your Telegram channel.
 
-> ⚠️ Для читання інших каналів потрібен **user client** (ваш особистий акаунт, API ID/Hash з my.telegram.org). Сам бот (BotFather‑token) не може читати чужі канали — лише публікувати. Тому тут **два** токени: user‑session (Telethon) + bot‑token.
+## Features
 
-## Що вміє MVP
-- Слухає задані канали (див. `sources.yml`), фільтрує нові повідомлення.
-- Витягує з тексту біржу, тип (spot/futures/alpha), пару/токен, час відкриття, мережу, контракт.
-- Формує **зведене повідомлення у стилі скрінів** (списки бірж і часів).
-- Дедуплікація (не дублює той самий меседж).
-- Відправляє у ваш канал (бот повинен бути адміністратором).
-- Локальна БД SQLite (`state.db`).
+- Concurrent polling of multiple exchanges with configurable interval.
+- Comparison between the last known snapshot and the current API response to detect fresh listings.
+- Deduplicated Telegram notifications with timestamps and trading links.
+- JSON state file to persist snapshots and avoid reposts between restarts.
+- Optional HTTP/HTTPS proxy support and BingX API key header.
 
-## Швидкий старт
-1) Встановіть Python 3.11+  
-2) Отримайте облікові дані:
-   - **API_ID & API_HASH**: https://my.telegram.org → API Development Tools
-   - **BOT_TOKEN**: у BotFather
-   - **TARGET_CHAT_ID**: ID каналу/чату, куди постити (додайте бота адміністратором)
-3) Скопіюйте `.env.example` у `.env` і заповніть значення.
-4) Відредагуйте `sources.yml` — додайте username каналів-джерел.
-5) Встановіть пакети та запустіть:
+## Quick start
+
+1. Install Python 3.11 or newer.
+2. Copy `.env.example` to `.env` and fill at least `BOT_TOKEN` and `TARGET_CHAT_ID`.
+3. Create a virtual environment and install dependencies:
+
 ```bash
 python -m venv .venv
-. .venv/bin/activate  # Windows: .venv\Scripts\activate
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-python app.py
 ```
-Перший запуск попросить ввести код підтвердження для Telethon (ваш user‑акаунт).
 
-## Файли
-- `app.py` — точка входу, клієнт Telethon + постер ботом.
-- `parser_patterns.py` — регулярки та парсер текстів (MEXC futures, блоки типу *binance (alpha) 14:00* тощо).
-- `sources.yml` — список каналів‑джерел (username або посилання).
-- `requirements.txt` — залежності.
-- `.env.example` — зразок змінних середовища.
-- `state.db` — створиться автоматично.
+4. Run the watcher:
 
-## Команди (простий режим керування)
-- Надішліть боту `/ping` у приват — отримаєте `pong` (перевірка підключення).
-- Надішліть боту `/sources` — бот пришле список джерел (з `sources.yml`).
+```bash
+python main.py
+```
 
-> За замовчуванням логи та алерти шлються у `OWNER_CHAT_ID`, якщо задано.
+The first run seeds the snapshots (no messages are sent). Subsequent runs will post every new pair detected by the exchanges.
 
-## Для переносу на сайт (roadmap)
-- Експорт подій у JSON/ICS.
-- Веб‑хуки (FastAPI) + Supabase для модерації/календаря.
-- Адмін‑команди: `/addsource`, `/delsource`, `/preview_today` тощо.
+## Configuration
 
-## Важливо
-- Дотримуйтесь правил/ToS джерел. Використовуйте з етичними цілями.
-- Скріни показують приклади форматування — ви можете змінити шаблон у `app.py`.
+All settings are read from environment variables (see `.env.example`). Useful options:
 
-Успіхів 🐝
+- `POLL_INTERVAL_SEC` — delay between requests for every feed (defaults to 60s).
+- `API_TIMEOUT_SEC` — HTTP timeout in seconds.
+- `ONLY_USDT` — keep only USDT quoted pairs (set `0` to disable the filter).
+- `SEED_ON_START` — when `1`, the first snapshot is stored without notifications.
+- `HTTP_PROXY` / `HTTPS_PROXY` — optional proxies.
+- `BINGX_API_KEY` — adds the header required for some BingX endpoints.
+- `STATE_FILE` — path to the persistence JSON file (default `state.json`).
+
+## Project structure
+
+```
+crypto_hornet/
+├── config.py          # Pydantic Settings wrapper
+├── exchanges/         # Exchange-specific API clients
+├── runner.py          # Async orchestrator and feed loop
+├── state.py           # Snapshot persistence
+├── telegram.py        # Telegram Bot API wrapper
+└── templates.py       # Message formatting helpers
+main.py                # Entry point
+requirements.txt       # Dependencies
+```
+
+## Supported exchanges & endpoints
+
+| Exchange | Market  | Endpoint |
+|----------|---------|----------|
+| Binance  | Spot    | `https://api.binance.com/api/v3/exchangeInfo` |
+| Binance  | Futures | `https://fapi.binance.com/fapi/v1/exchangeInfo` |
+| OKX      | Spot    | `https://www.okx.com/api/v5/public/instruments?instType=SPOT` |
+| OKX      | Futures | `https://www.okx.com/api/v5/public/instruments?instType=SWAP` |
+| Gate.io  | Spot    | `https://api.gateio.ws/api/v4/spot/currency_pairs` |
+| Gate.io  | Futures | `https://api.gateio.ws/api/v4/futures/usdt/contracts` |
+| Bitget   | Spot    | `https://api.bitget.com/api/spot/v1/public/products` |
+| Bitget   | Futures | `https://api.bitget.com/api/mix/v1/market/contracts?productType=umcbl` |
+| MEXC     | Futures | `https://contract.mexc.com/api/v1/contract/detail`, `.../contract/list` |
+| BingX    | Spot    | `https://open-api.bingx.com/openApi/spot/v1/common/symbols` |
+| BingX    | Futures | `https://open-api.bingx.com/openApi/swap/v2/quote/contracts` |
+| Bybit    | Spot    | `https://api.bybit.com/v5/market/instruments-info?category=spot` |
+| Bybit    | Futures | `https://api.bybit.com/v5/market/instruments-info?category=linear` |
+
+## Development
+
+Formatting is intentionally minimal; run `python -m crypto_hornet.runner` during development or execute `python main.py` directly. Contributions are welcome — feel free to extend `crypto_hornet/exchanges` with additional markets or better heuristics.
