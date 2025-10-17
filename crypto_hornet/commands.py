@@ -22,7 +22,7 @@ else:
 
 log = logging.getLogger(__name__)
 
-LATEST_EXCHANGES: Tuple[str, ...] = ("bingx", "gate", "bitget")
+LATEST_EXCHANGES: Tuple[str, ...] = ("bingx", "gate", "bitget", "kucoin")
 LATEST_MARKETS: Tuple[str, ...] = ("spot", "futures")
 
 

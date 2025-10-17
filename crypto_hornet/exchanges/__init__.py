@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Iterable
 
 from . import base
-from . import binance, bingx, bitget, bybit, gate, mexc, okx
+from . import binance, bingx, bitget, bybit, gate, kucoin, mexc, okx
 
 __all__ = ["build_feeds", "base"]
 
@@ -34,6 +34,10 @@ def _source_hint(exchange: str, market: str) -> str:
         return "Bitget products API"
     if exchange == "bitget":
         return "Bitget mix contracts API"
+    if exchange == "kucoin" and market == "spot":
+        return "KuCoin symbols API"
+    if exchange == "kucoin":
+        return "KuCoin futures contracts API"
     if exchange == "mexc":
         return "MEXC contract detail/list API"
     if exchange == "bingx" and market == "spot":
@@ -57,6 +61,8 @@ def build_feeds(default_interval: int) -> Iterable[base.Feed]:
         ("gate", "futures", gate.futures),
         ("bitget", "spot", bitget.spot),
         ("bitget", "futures", bitget.futures),
+        ("kucoin", "spot", kucoin.spot),
+        ("kucoin", "futures", kucoin.futures),
         ("mexc", "futures", mexc.futures),
         ("bingx", "spot", bingx.spot),
         ("bingx", "futures", bingx.futures),

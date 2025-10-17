@@ -1,6 +1,6 @@
 # Crypto Hornet — Exchange Listings Watcher
 
-Crypto Hornet now focuses on **direct exchange APIs** instead of Telegram scraping. The bot polls the official endpoints for Binance, OKX, Gate.io, Bitget, MEXC, BingX and Bybit (spot and futures where available) and instantly posts every newly listed USDT pair to your Telegram channel.
+Crypto Hornet now focuses on **direct exchange APIs** instead of Telegram scraping. The bot polls the official endpoints for Binance, OKX, Gate.io, Bitget, MEXC, BingX, Bybit and KuCoin (spot and futures where available) and instantly posts every newly listed USDT pair to your Telegram channel.
 
 ## Features
 
@@ -26,13 +26,7 @@ The first run seeds the snapshots (no messages are sent). Subsequent runs will p
 ## Configuration
 
 All settings are read from environment variables (see `.env.example`). Useful options:
-- `POLL_INTERVAL_SEC` — delay between requests for every feed (defaults to 60s).
-- `API_TIMEOUT_SEC` — HTTP timeout in seconds.
-- `ONLY_USDT` — keep only USDT quoted pairs (set `0` to disable the filter).
-- `SEED_ON_START` — when `1`, the first snapshot is stored without notifications.
-- `HTTP_PROXY` / `HTTPS_PROXY` — optional proxies.
-- `BINGX_API_KEY` — adds the header required for some BingX endpoints.
-- `STATE_FILE` — path to the persistence JSON file (default `state.json`).
+@@ -36,34 +36,36 @@ All settings are read from environment variables (see `.env.example`). Useful op
 
 ## Project structure
 
@@ -58,6 +52,8 @@ requirements.txt       # Dependencies
 | Gate.io  | Futures | `https://api.gateio.ws/api/v4/futures/usdt/contracts` |
 | Bitget   | Spot    | `https://api.bitget.com/api/spot/v1/public/products` |
 | Bitget   | Futures | `https://api.bitget.com/api/mix/v1/market/contracts?productType=umcbl` |
+| KuCoin   | Spot    | `https://api.kucoin.com/api/v2/symbols` |
+| KuCoin   | Futures | `https://api-futures.kucoin.com/api/v1/contracts/active` |
 | MEXC     | Futures | `https://contract.mexc.com/api/v1/contract/detail`, `.../contract/list` |
 | BingX    | Spot    | `https://open-api.bingx.com/openApi/spot/v1/common/symbols` |
 | BingX    | Futures | `https://open-api.bingx.com/openApi/swap/v2/quote/contracts` |
