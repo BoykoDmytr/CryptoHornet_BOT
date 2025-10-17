@@ -14,14 +14,7 @@ Crypto Hornet now focuses on **direct exchange APIs** instead of Telegram scrapi
 
 1. Install Python 3.11 or newer.
 2. Copy `.env.example` to `.env` and fill at least `BOT_TOKEN` and `TARGET_CHAT_ID`.
-3. Create a virtual environment and install dependencies:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-```
-
+3. Create a virtual environment and install dependencies
 4. Run the watcher:
 
 ```bash
@@ -33,7 +26,6 @@ The first run seeds the snapshots (no messages are sent). Subsequent runs will p
 ## Configuration
 
 All settings are read from environment variables (see `.env.example`). Useful options:
-
 - `POLL_INTERVAL_SEC` — delay between requests for every feed (defaults to 60s).
 - `API_TIMEOUT_SEC` — HTTP timeout in seconds.
 - `ONLY_USDT` — keep only USDT quoted pairs (set `0` to disable the filter).
@@ -55,9 +47,7 @@ crypto_hornet/
 main.py                # Entry point
 requirements.txt       # Dependencies
 ```
-
 ## Supported exchanges & endpoints
-
 | Exchange | Market  | Endpoint |
 |----------|---------|----------|
 | Binance  | Spot    | `https://api.binance.com/api/v3/exchangeInfo` |
