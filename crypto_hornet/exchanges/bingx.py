@@ -1,7 +1,7 @@
 """BingX exchange fetchers."""
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Iterable, Tuple
 
 import httpx
 
@@ -12,6 +12,39 @@ def _headers(client: httpx.AsyncClient) -> dict[str, str]:
     api_key = client.headers.get("X-BX-APIKEY") or client.headers.get("x-bx-apikey") or ""
     return {"X-BX-APIKEY": api_key} if api_key else {}
 
+def _iter_spot_pairs(item: object) -> Iterable[Tuple[str, str]]:
+    if not isinstance(item, dict):
+        return []
+
+    base = (item.get("baseAsset") or item.get("baseCurrency") or item.get("base") or "").upper()
+    quote = (item.get("quoteAsset") or item.get("quoteCurrency") or item.get("quote") or "").upper()
+
+    symbol = (
+        item.get("symbol")
+        or item.get("symbolName")
+        or item.get("symbolCode")
+        or item.get("pair")
+        or ""
+    )
+    if symbol and not base and not quote:
+        cleaned = symbol.replace("-", "/").replace("_", "/")
+        if "/" in cleaned:
+            base, quote = cleaned.split("/", 1)
+            base, quote = base.upper(), quote.upper()
+
+    if base and quote:
+        return [(base, quote)]
+
+    # BingX also returns nested lists under the "symbols" key for composite
+    # responses. Fall back to those if available.
+    nested = item.get("symbols") if isinstance(item, dict) else None
+    if isinstance(nested, list):
+        pairs: list[Tuple[str, str]] = []
+        for child in nested:
+            pairs.extend(_iter_spot_pairs(child))
+        return pairs
+
+    return []
 
 async def spot(client: httpx.AsyncClient) -> Snapshot:
     hosts = [
