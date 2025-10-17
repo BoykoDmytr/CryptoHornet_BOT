@@ -22,6 +22,11 @@ class TelegramClient:
         self._owner_chat_id = owner_chat_id
         self._lock = asyncio.Lock()
 
+    @property
+    def bot(self) -> Bot:
+        """Expose the underlying Bot instance for auxiliary operations."""
+        return self._bot
+    
     async def __aenter__(self) -> "TelegramClient":
         await self._bot.initialize()
         return self

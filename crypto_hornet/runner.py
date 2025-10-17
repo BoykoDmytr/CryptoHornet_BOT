@@ -5,6 +5,7 @@ from typing import Iterable
 
 import httpx
 
+from .commands import run_command_listener
 from .config import Settings
 from .exchanges import base as exchanges_base
 from .exchanges import build_feeds
@@ -110,10 +111,12 @@ async def run(settings: Settings) -> None:
                 await _seed_if_needed(store, feeds, client, seed_only=True)
                 log.info("Initial seeding complete")
             await telegram.send_text("✅ Crypto Hornet API watcher started")
+            command_task = asyncio.create_task(run_command_listener(settings, store, telegram))
             tasks = [
                 asyncio.create_task(
                     _run_feed(feed, settings=settings, store=store, client=client, telegram=telegram)
                 )
                 for feed in feeds
             ]
+            tasks.append(command_task)
             await asyncio.gather(*tasks)
