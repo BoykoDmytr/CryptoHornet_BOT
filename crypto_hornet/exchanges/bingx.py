@@ -64,13 +64,8 @@ async def spot(client: httpx.AsyncClient) -> Snapshot:
         elif isinstance(payload, list):
             data = payload
         for item in data or []:
-            if not isinstance(item, dict):
-                continue
-            base = (item.get("baseAsset") or "").upper()
-            quote = (item.get("quoteAsset") or "").upper()
-            if not base or not quote:
-                continue
-            out[f"{base}/{quote}"] = f"https://bingx.com/en-us/spot/{base}_{quote}"
+            for base, quote in _iter_spot_pairs(item):
+                out[f"{base}/{quote}"] = f"https://bingx.com/en-us/spot/{base}_{quote}"
         if out:
             break
     return out
