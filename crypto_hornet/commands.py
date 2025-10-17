@@ -102,6 +102,8 @@ async def _handle_simulate(
         pair=pair,
         url=None,
         discovered_at=exchanges_base.now_utc(),
+        source="Manual simulation",
+        speed_tier="Simulation",
     )
     await telegram.post_listing(event)
     await telegram.bot.send_message(chat_id=chat_id, text=f"Simulated listing for {pair} posted.")

@@ -77,6 +77,8 @@ async def _run_feed(
                                 pair=pair,
                                 url=url,
                                 discovered_at=exchanges_base.now_utc(),
+                                source=feed.source,
+                                speed_tier=feed.speed_tier,
                             )
                         )
                     posted_records: list[PostedRecord] = []

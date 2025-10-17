@@ -7,11 +7,15 @@ from datetime import datetime, timezone
 
 @dataclass(slots=True)
 class ListingEvent:
+    """Structure describing a detected listing."""
+
     exchange: str
     market: str
     pair: str
     url: str | None
     discovered_at: datetime
+    source: str | None = None
+    speed_tier: str | None = None
 
     @property
     def base(self) -> str:
@@ -28,25 +32,25 @@ def _format_timestamp(moment: datetime) -> str:
 
 
 def format_listing(event: ListingEvent) -> str:
-    exchange = event.exchange.upper()
-    market = event.market.lower()
-    discovered = _format_timestamp(event.discovered_at)
-    url = event.url or ""
+    """Render a high signal alert for Telegram."""
 
-    if market == "futures":
-        pair_flat = event.pair.replace("/", "")
-        lines = [
-            f"✅ {exchange} — futures {pair_flat} now launched for futures trading and trading bots",
-            f"Пара: {event.pair}",
-            f"🕒 Старт: {discovered}",
-        ]
-    else:
-        lines = [
-            f"✅ {exchange} — spot нова пара (API)",
-            f"🕒 Дата: {discovered}",
-            "",
-            f"Пара: {event.pair}",
-        ]
-    if url:
-        lines.append(f"🔗 Тікер: {url}")
+    exchange = event.exchange.upper()
+    market = event.market.upper()
+    discovered = _format_timestamp(event.discovered_at)
+    header = f"🚀 {exchange} {market} LISTING ALERT"
+    tier_line = f"⚡️ Speed tier: {event.speed_tier}" if event.speed_tier else None
+    source_line = f"🛰 Source: {event.source}" if event.source else None
+    url_line = f"🔗 Link: {event.url}" if event.url else None
+
+    lines = [
+        header,
+        f"📈 Pair: {event.pair}",
+        f"⏱ Detected: {discovered} UTC",
+    ]
+    if tier_line:
+        lines.append(tier_line)
+    if source_line:
+        lines.append(source_line)
+    if url_line:
+        lines.append(url_line)
     return "\n".join(lines)

@@ -21,6 +21,8 @@ class Feed:
     market: str
     interval: int
     fetch: Fetcher
+    source: str | None = None
+    speed_tier: str | None = None
 
     @property
     def key(self) -> str:
