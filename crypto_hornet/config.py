@@ -4,7 +4,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from pydantic import BaseSettings, Field, validator
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -26,13 +27,14 @@ class Settings(BaseSettings):
 
     bingx_api_key: Optional[str] = Field(None, alias="BINGX_API_KEY")
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = False
-        allow_mutation = False
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        frozen=True,
+    )
 
-    @validator("poll_interval", "request_timeout")
+    @field_validator("poll_interval", "request_timeout")
     def _positive(cls, value: int) -> int:  # noqa: N805
         if value <= 0:
             raise ValueError("Interval values must be positive")
