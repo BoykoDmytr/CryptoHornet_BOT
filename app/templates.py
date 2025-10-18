@@ -30,10 +30,15 @@ def spot_message(exchange: str, symbol: str, start_time: Optional[datetime], spe
     time_cell = _time_cell(start_time, provisional)
     return (
         f"🚀 {exchange} SPOT LISTING ALERT"
+
         f"📈 Pair: {symbol}/USDT"
+
         f"⏱ Start: {time_cell}"
+
         f"⚡️ Speed tier: {tier_name} — {tier_desc}"
+
         f"🛰 Source: {source_name}"
+        
         f"🔗 Link: {url}"
     )
 
@@ -43,9 +48,14 @@ def futures_message(exchange: str, symbol: str, start_time: Optional[datetime], 
     time_cell = _time_cell(start_time, provisional)
     return (
         f"🚀 {exchange} FUTURES LISTING ALERT"
+
         f"📈 Pair: {symbol}/USDT"
+
         f"⏱ Start: {time_cell}"
+
         f"⚡️ Speed tier: {tier_name} — {tier_desc}"
+
         f"🛰 Source: {source_name}"
+
         f"🔗 Link: {url}"
     )
