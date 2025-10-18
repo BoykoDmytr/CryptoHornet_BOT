@@ -6,6 +6,12 @@ import os
 API_KEY = os.getenv("BINGX_API_KEY", "")
 HEADERS = {"X-BX-APIKEY": API_KEY} if API_KEY else {}
 
+SPOT_ENDPOINT = os.getenv("BINGX_SPOT_SYMBOLS_ENDPOINT",
+                          "https://open-api.bingx.com/openApi/spot/v1/common/symbols")
+FUT_ENDPOINT  = os.getenv("BINGX_FUTURES_CONTRACTS_ENDPOINT",
+                          "https://api-swap-rest.bingx.com/api/v1/contract/symbols")
+
+
 name = "BINGX"
 # NOTE: Some BingX spot endpoints may require API keys; adjust if needed.
 ENDPOINT = "https://open-api.bingx.com/openApi/spot/v1/common/symbols"  # verify in production
