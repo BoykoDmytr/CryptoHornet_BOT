@@ -25,37 +25,26 @@ def _time_cell(start_time: Optional[datetime], provisional: bool) -> str:
     )
 
 
-def spot_message(exchange: str, symbol: str, start_time: Optional[datetime], speed_tier: int, source_name: str, url: str, provisional: bool = False) -> str:
-    tier_name, tier_desc = {1:("Tier 1","Webhook/push"),2:("Tier 2","Fast API polling"),3:("Tier 3","RSS/HTML")}[speed_tier]
+def spot_message(exchange, symbol, start_time, speed_tier, source_name, url, provisional=False):
+    tier_name, tier_desc = {1:("Tier 1","Webhook/push"), 2:("Tier 2","Fast API polling"), 3:("Tier 3","RSS/HTML")}[speed_tier]
     time_cell = _time_cell(start_time, provisional)
     return (
-        f"🚀 {exchange} SPOT LISTING ALERT"
-
-        f"📈 Pair: {symbol}/USDT"
-
-        f"⏱ Start: {time_cell}"
-
-        f"⚡️ Speed tier: {tier_name} — {tier_desc}"
-
-        f"🛰 Source: {source_name}"
-        
+        f"🚀 {exchange} SPOT LISTING ALERT\n"
+        f"📈 Pair: {symbol}/USDT\n"
+        f"⏱️ Start: {time_cell}\n"
+        f"⚡️ Speed tier: {tier_name} — {tier_desc}\n"
+        f"🛰 Source: {source_name}\n"
         f"🔗 Link: {url}"
     )
 
-
-def futures_message(exchange: str, symbol: str, start_time: Optional[datetime], speed_tier: int, source_name: str, url: str, provisional: bool = False) -> str:
-    tier_name, tier_desc = {1:("Tier 1","Webhook/push"),2:("Tier 2","Fast API polling"),3:("Tier 3","RSS/HTML")}[speed_tier]
+def futures_message(exchange, symbol, start_time, speed_tier, source_name, url, provisional=False):
+    tier_name, tier_desc = {1:("Tier 1","Webhook/push"), 2:("Tier 2","Fast API polling"), 3:("Tier 3","RSS/HTML")}[speed_tier]
     time_cell = _time_cell(start_time, provisional)
     return (
-        f"🚀 {exchange} FUTURES LISTING ALERT"
-
-        f"📈 Pair: {symbol}/USDT"
-
-        f"⏱ Start: {time_cell}"
-
-        f"⚡️ Speed tier: {tier_name} — {tier_desc}"
-
-        f"🛰 Source: {source_name}"
-
+        f"🚀 {exchange} FUTURES LISTING ALERT\n"
+        f"📈 Pair: {symbol}/USDT\n"
+        f"⏱️ Start: {time_cell}\n"
+        f"⚡️ Speed tier: {tier_name} — {tier_desc}\n"
+        f"🛰 Source: {source_name}\n"
         f"🔗 Link: {url}"
     )
