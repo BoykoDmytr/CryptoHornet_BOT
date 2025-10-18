@@ -1,15 +1,26 @@
+import os
 import httpx
 from typing import AsyncIterator
 from app.exchanges.base import Listing
 from app.utils.time import now_utc
-import os
+
+name = "BINGX"
+
 API_KEY = os.getenv("BINGX_API_KEY", "")
 HEADERS = {"X-BX-APIKEY": API_KEY} if API_KEY else {}
 
-SPOT_ENDPOINT = os.getenv("BINGX_SPOT_SYMBOLS_ENDPOINT",
-                          "https://open-api.bingx.com/openApi/spot/v1/common/symbols")
-FUT_ENDPOINT  = os.getenv("BINGX_FUTURES_CONTRACTS_ENDPOINT",
-                          "https://api-swap-rest.bingx.com/api/v1/contract/symbols")
+# Spot
+SPOT_ENDPOINT = os.getenv(
+    "BINGX_SPOT_SYMBOLS_ENDPOINT",
+    "https://open-api.bingx.com/openApi/spot/v1/common/symbols",
+)
+
+# Futures
+FUT_ENDPOINT = os.getenv(
+    "BINGX_FUTURES_CONTRACTS_ENDPOINT",
+    "https://api-swap-rest.bingx.com/api/v1/contract/symbols",
+)
+
 
 
 name = "BINGX"
