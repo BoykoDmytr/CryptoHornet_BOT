@@ -2,6 +2,9 @@ import httpx
 from typing import AsyncIterator
 from app.exchanges.base import Listing
 from app.utils.time import now_utc
+import os
+API_KEY = os.getenv("BINGX_API_KEY", "")
+HEADERS = {"X-BX-APIKEY": API_KEY} if API_KEY else {}
 
 name = "BINGX"
 # NOTE: Some BingX spot endpoints may require API keys; adjust if needed.
@@ -14,12 +17,11 @@ class BingXSpot:
         self._known: set[str] = set()
 
     async def _fetch(self) -> list[dict]:
-        async with httpx.AsyncClient(timeout=10) as cx:
+        async with httpx.AsyncClient(timeout=10, headers=HEADERS) as cx:
             r = await cx.get(ENDPOINT)
             r.raise_for_status()
             data = r.json()
-            # possible shapes: {"data":[{"symbol":"RVVUSDT", ...}]}
-            return (data.get("data") or data.get("symbols") or [])
+            return data.get("data", [])
 
     async def stream(self) -> AsyncIterator[Listing]:
         import asyncio
