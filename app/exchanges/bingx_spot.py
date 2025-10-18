@@ -9,56 +9,61 @@ name = "BINGX"
 API_KEY = os.getenv("BINGX_API_KEY", "")
 HEADERS = {"X-BX-APIKEY": API_KEY} if API_KEY else {}
 
-# Spot
-SPOT_ENDPOINT = os.getenv(
+ENDPOINT = os.getenv(
     "BINGX_SPOT_SYMBOLS_ENDPOINT",
     "https://open-api.bingx.com/openApi/spot/v1/common/symbols",
 )
+TRADE_URL = os.getenv("BINGX_SPOT_TRADE_URL", "https://bingx.com/en-us/spot/{base}USDT")
 
-# Futures
-FUT_ENDPOINT = os.getenv(
-    "BINGX_FUTURES_CONTRACTS_ENDPOINT",
-    "https://api-swap-rest.bingx.com/api/v1/contract/symbols",
-)
-
-
-
-name = "BINGX"
-# NOTE: Some BingX spot endpoints may require API keys; adjust if needed.
-ENDPOINT = "https://open-api.bingx.com/openApi/spot/v1/common/symbols"  # verify in production
-TRADE_URL = "https://bingx.com/en-us/spot/{base}USDT"
 
 class BingXSpot:
     def __init__(self, poll_seconds: float = 2.0):
         self.poll_seconds = poll_seconds
         self._known: set[str] = set()
+        self.seed_on_start = os.getenv("API_SEED_ON_START", "1") == "1"
+        self._seeded = False
 
     async def _fetch(self) -> list[dict]:
         async with httpx.AsyncClient(timeout=10, headers=HEADERS) as cx:
-            r = await cx.get(SPOT_ENDPOINT)   # or FUT_ENDPOINT in the futures file
+            r = await cx.get(ENDPOINT)
             r.raise_for_status()
             data = r.json()
-            return data.get("data", [])
+            return (data.get("data") or data.get("symbols") or [])
 
     async def stream(self) -> AsyncIterator[Listing]:
         import asyncio
+
+        if not self._seeded and self.seed_on_start:
+            try:
+                for it in await self._fetch():
+                    sym = it.get("symbol") or it.get("s") or ""
+                    if not sym.endswith("USDT"):
+                        continue
+                    base = sym[:-5]  # strip 'USDT'
+                    dedupe_key = f"BINGX:SPOT:{base}"
+                    self._known.add(dedupe_key)
+                self._seeded = True
+            except Exception:
+                await asyncio.sleep(1)
+
         while True:
             try:
                 for it in await self._fetch():
                     sym = it.get("symbol") or it.get("s") or ""
                     if not sym.endswith("USDT"):
                         continue
-                    base = sym.replace("USDT", "")
+                    base = sym[:-5]
                     dedupe_key = f"BINGX:SPOT:{base}"
                     if dedupe_key in self._known:
                         continue
                     self._known.add(dedupe_key)
-                    start = now_utc()
+
                     yield Listing(
                         exchange=name,
                         market_type="SPOT",
                         symbol=base,
-                        source_time=start,
+                        source_time=None,
+                        provisional=True,
                         source_name="BingX spot symbols API",
                         source_url=TRADE_URL.format(base=base),
                         speed_tier=2,
@@ -67,5 +72,6 @@ class BingXSpot:
             except Exception:
                 await asyncio.sleep(1)
             await asyncio.sleep(self.poll_seconds)
+
 
 Adapter = BingXSpot

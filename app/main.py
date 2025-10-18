@@ -4,20 +4,22 @@ import os
 import signal
 from contextlib import suppress
 
+# Optional perf on Linux
 try:
-    import uvloop  # optional perf on linux
+    import uvloop  # type: ignore
     uvloop.install()
 except Exception:
     pass
 
+from telegram import Update
 from telegram.ext import Application, CommandHandler
 from telegram.request import HTTPXRequest
-from telegram import Update
 
 from app.config import load_settings
 from app.store import init_db
 from app.bot_handlers import register_admin
 from app.poller import run_all
+from app.reconciler import run_announcements
 from app.utils.logging import logger
 
 
@@ -27,7 +29,12 @@ async def cmd_start(update: Update, _):
 
 
 async def on_startup(app: Application):
-    """Initialize DB and kick off background pollers (no JobQueue)."""
+    """
+    - Validates envs
+    - Initializes DB (creates tables)
+    - Starts pollers + announcements reconciler as background tasks
+    """
+    # Load settings (env-based)
     settings = load_settings()
 
     if not settings.bot_token:
@@ -37,37 +44,55 @@ async def on_startup(app: Application):
         logger.error("TARGET_CHAT_ID is empty. Set TARGET_CHAT_ID in env.")
         raise SystemExit(1)
 
-    # DB (auto-creates SQLite file/tables)
+    # DB (auto-creates SQLite file/tables; parent dir ensured in store.py)
     sessionmaker = await init_db(settings.database_url)
     logger.info("Database initialized at %s", settings.database_url)
 
-    # save for shutdown
+    # Save for shutdown
     app.bot_data["settings"] = settings
     app.bot_data["sessionmaker"] = sessionmaker
 
-    # Start exchange pollers as a single background task
-    # We send messages using the same bot instance Application manages.
+    # Handlers (/ping, /status, etc.)
+    await register_admin(app)
+
+    # Convenience for background tasks
     bot = app.bot
-    bot._default_chat_id = settings.target_chat_id  # convenience for poller
-    task = asyncio.create_task(run_all(settings, bot, sessionmaker))
-    app.bot_data["pollers_task"] = task
+    bot._default_chat_id = settings.target_chat_id  # type: ignore[attr-defined]
+
+    # Log enabled adapters
+    enabled = [f"{ex.name}<{ex.module}>" for ex in settings.exchanges if ex.enabled]
+    logger.info("Enabled exchanges: %s", ", ".join(enabled) or "(none)")
+
+    # Launch exchange pollers (concurrent)
+    pollers_task = asyncio.create_task(run_all(settings, bot, sessionmaker))
+    app.bot_data["pollers_task"] = pollers_task
+
+    # Launch announcements reconciler (Phase B)
+    ann_interval = int(os.getenv("ANN_INTERVAL_SEC", "600"))
+    ann_task = asyncio.create_task(run_announcements(bot, sessionmaker, ann_interval))
+    app.bot_data["ann_task"] = ann_task
 
     logger.info("Telegram polling started.")
 
 
 async def on_shutdown(app: Application):
-    """Graceful shutdown: cancel pollers task."""
+    """Graceful shutdown: cancel background tasks and wait for them."""
     logger.info("Shutdown initiated.")
-    task = app.bot_data.pop("pollers_task", None)
-    if task:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+    for key in ("pollers_task", "ann_task"):
+        task = app.bot_data.pop(key, None)
+        if task:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
     logger.info("Shutdown complete.")
 
 
 def build_app() -> Application:
-    # Tune HTTP pool to avoid PoolTimeout under bursts
+    """
+    Build the PTB Application with a bigger HTTPX pool to avoid PoolTimeout
+    during message bursts, and attach lifecycle hooks.
+    """
+    # Throughput knobs (can set in Railway env)
     pool_size = int(os.getenv("TG_POOL_SIZE", "100"))
     pool_timeout = float(os.getenv("TG_POOL_TIMEOUT", "10.0"))
 
@@ -87,18 +112,12 @@ def build_app() -> Application:
         .build()
     )
 
-    # Admin handlers from your project + a basic /start
+    # Basic sanity command
     app.add_handler(CommandHandler("start", cmd_start))
-    asyncio.get_event_loop()  # ensure loop exists before registering
+
+    # Lifecycle hooks
     app.post_init = on_startup
     app.post_shutdown = on_shutdown
-
-    # Your existing admin commands
-    # (register_admin adds /ping, /status, etc.)
-    # Needs to be awaited later; do it here via a convenience init hook:
-    async def _register(_):
-        await register_admin(app)
-    app.pre_run = _register  # PTB will await this before entering polling
 
     return app
 
@@ -106,16 +125,15 @@ def build_app() -> Application:
 def main():
     app = build_app()
 
-    # Let PTB handle signals; also add explicit handlers for Railway
+    # Let PTB run polling; add explicit signal hooks for Railway/Docker
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         with suppress(NotImplementedError):
             loop.add_signal_handler(sig, lambda: asyncio.create_task(app.stop()))
 
-    # Run polling (blocking). No JobQueue needed.
     app.run_polling(
         drop_pending_updates=True,
-        stop_signals=None,  # we handle signals above
+        stop_signals=None,  # handled above
     )
 
 
