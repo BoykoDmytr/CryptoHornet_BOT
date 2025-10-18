@@ -58,18 +58,34 @@ async def handle_listing(bot: Bot, db: AsyncSession, listing) -> None:
     logger.info(f"Sent {listing.exchange} {listing.market_type} {listing.symbol} msg_id={sent.message_id}")
 
 
-async def run_adapter(adapter_factory: Callable, poll_seconds: float, bot: Bot, db: AsyncSession):
-    adapter = adapter_factory(poll_seconds=poll_seconds)
-    async for listing in adapter.stream():
-        await handle_listing(bot, db, listing)
+async def run_adapter(adapter_factory: Callable, poll_seconds: float, bot: Bot, db: AsyncSession, name: str):
+    """Run one exchange adapter with robust logging/backoff."""
+    while True:
+        try:
+            logger.info(f"[ADAPTER START] {name} poll_seconds={poll_seconds}")
+            adapter = adapter_factory(poll_seconds=poll_seconds)
+            async for listing in adapter.stream():
+                try:
+                    await handle_listing(bot, db, listing)
+                except Exception as e:
+                    logger.exception(f"[ADAPTER HANDLE ERROR] {name} symbol={getattr(listing,'symbol', '?')}: {e}")
+            # If stream ends (shouldn’t), restart after short pause
+            logger.warning(f"[ADAPTER STOPPED] {name} stream ended unexpectedly; restarting in 3s")
+            await asyncio.sleep(3)
+        except Exception as e:
+            logger.exception(f"[ADAPTER CRASH] {name}: {e}")
+            await asyncio.sleep(5)  # backoff and try again
 
 
 async def run_all(settings, bot: Bot, db_sessionmaker):
     tasks = []
     for ex in settings.exchanges:
         if not ex.enabled:
+            logger.info(f"[ADAPTER SKIP] {ex.name} ({ex.module}) disabled")
             continue
         module = importlib.import_module(ex.module)
         adapter_factory = getattr(module, "Adapter")
-        tasks.append(asyncio.create_task(run_adapter(adapter_factory, ex.poll_seconds, bot, db_sessionmaker())))
+        # log that we're launching
+        logger.info(f"[ADAPTER LAUNCH] {ex.name} ({ex.module})")
+        tasks.append(asyncio.create_task(run_adapter(adapter_factory, ex.poll_seconds, bot, db_sessionmaker(), ex.name)))
     await asyncio.gather(*tasks)
